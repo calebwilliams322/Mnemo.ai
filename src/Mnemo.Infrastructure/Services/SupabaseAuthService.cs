@@ -158,6 +158,35 @@ public class SupabaseAuthService : ISupabaseAuthService
         }
     }
 
+    public async Task<bool> SendPasswordResetAsync(string email)
+    {
+        try
+        {
+            // Use the recovery endpoint to send a password reset email
+            var response = await _httpClient.PostAsJsonAsync("/auth/v1/recover", new
+            {
+                email
+            });
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning(
+                    "Supabase password reset failed: {StatusCode} - {Content}",
+                    response.StatusCode, errorContent);
+                return false;
+            }
+
+            _logger.LogInformation("Password reset email sent for: {Email}", email);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send password reset for email: {Email}", email);
+            return false;
+        }
+    }
+
     // Response model for Supabase Admin API
     private class SupabaseAdminUserResponse
     {

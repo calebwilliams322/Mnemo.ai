@@ -38,3 +38,6 @@ public record SignupResponse(
     Guid UserId,
     string Email,
     string Message);
+
+// Password reset DTOs
+public record PasswordResetRequest(string Email);

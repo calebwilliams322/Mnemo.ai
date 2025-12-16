@@ -34,6 +34,7 @@ public class MnemoDbContext : DbContext
     public DbSet<Message> Messages => Set<Message>();
     public DbSet<Webhook> Webhooks => Set<Webhook>();
     public DbSet<WebhookDelivery> WebhookDeliveries => Set<WebhookDelivery>();
+    public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -79,6 +80,7 @@ public class MnemoDbContext : DbContext
         ConfigureMessage(modelBuilder);
         ConfigureWebhook(modelBuilder);
         ConfigureWebhookDelivery(modelBuilder);
+        ConfigureAuditEvent(modelBuilder);
 
         // Global query filters for tenant isolation
         // All tenant-scoped entities automatically filter by current tenant
@@ -416,6 +418,34 @@ public class MnemoDbContext : DbContext
                 .WithMany(w => w.Deliveries)
                 .HasForeignKey(e => e.WebhookId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+
+    private static void ConfigureAuditEvent(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<AuditEvent>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.EventType).HasMaxLength(50).IsRequired();
+            entity.Property(e => e.EventStatus).HasMaxLength(20).IsRequired();
+            entity.Property(e => e.IpAddress).HasMaxLength(50);
+            entity.Property(e => e.UserAgent).HasMaxLength(500);
+            entity.Property(e => e.Details).HasColumnType("jsonb");
+
+            entity.HasIndex(e => e.TenantId);
+            entity.HasIndex(e => e.UserId);
+            entity.HasIndex(e => e.EventType);
+            entity.HasIndex(e => e.CreatedAt);
+
+            entity.HasOne(e => e.Tenant)
+                .WithMany()
+                .HasForeignKey(e => e.TenantId)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            entity.HasOne(e => e.User)
+                .WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.SetNull);
         });
     }
 

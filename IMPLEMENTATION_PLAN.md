@@ -287,6 +287,115 @@ Manually tested the complete auth flow:
 - `src/Mnemo.Application/Services/ISupabaseAuthService.cs` - Interface
 - `tests/Mnemo.Api.Tests/AuthenticationTests.cs` - 13 integration tests
 
+### 2.6 Row Level Security (Database Protection) ✅ COMPLETE
+- [x] Enable RLS on all 14 tables in Supabase
+- [x] Create RLS policies for tenant isolation:
+  - `users` - users can only see users in their tenant
+  - `documents` - tenant-scoped
+  - `policies` - tenant-scoped
+  - `coverages` - linked via policy → tenant (FK-based policy)
+  - `document_chunks` - linked via document → tenant (FK-based policy)
+  - `compliance_checks` - tenant-scoped
+  - `contract_requirements` - tenant-scoped
+  - `conversations` - tenant-scoped
+  - `messages` - linked via conversation → tenant (FK-based policy)
+  - `submission_groups` - tenant-scoped
+  - `webhooks` - tenant-scoped
+  - `webhook_deliveries` - linked via webhook → tenant (FK-based policy)
+  - `tenants` - users can only see their own tenant
+  - `industry_benchmarks` - read-only for all authenticated users
+- [x] Test RLS policies work correctly
+
+**Files created:**
+- `sql/rls_policies.sql` - Main RLS policies and `get_current_tenant_id()` function
+- `sql/rls_policies_fix.sql` - FK-based policies for tables without direct tenant_id
+
+**🧪 Test checkpoint 2.6:**
+- [x] Direct Supabase query blocked without valid JWT
+- [x] User cannot query other tenant's data via direct DB access
+- [x] RLS + application filters provide defense in depth
+
+### 2.7 Rate Limiting ✅ COMPLETE
+- [x] Add rate limiting middleware via `builder.Services.AddRateLimiter()`
+- [x] Configure limits:
+  - `POST /auth/signup` - 5 requests per IP per hour ("signup" policy)
+  - `POST /auth/password-reset` - 5 requests per IP per hour (uses "signup" policy)
+  - `POST /tenant/users/invite` - 20 requests per user per hour ("invite" policy)
+  - General API - 100 requests per user per minute ("api" policy)
+- [x] Return 429 Too Many Requests when limit exceeded
+- [x] Applied to endpoints via `.RequireRateLimiting()`
+
+**🧪 Test checkpoint 2.7:**
+- [x] Rate limiting triggers after threshold
+- [x] Returns proper 429 response
+- [x] Limits reset after window expires
+
+### 2.8 Audit Logging ✅ COMPLETE
+- [x] Create `AuditEvent` entity and table with RLS
+- [x] Create `IAuditService` interface and `AuditService` implementation
+- [x] Log auth events:
+  - Signup attempts (success/failure with reason)
+  - Password reset requests
+  - User invites sent
+  - User deactivation/reactivation
+- [x] Include: timestamp, user_id, tenant_id, event_type, event_status, ip_address, user_agent, details (JSON)
+
+**Files created:**
+- `src/Mnemo.Domain/Entities/AuditEvent.cs` - Entity
+- `src/Mnemo.Application/Services/IAuditService.cs` - Interface
+- `src/Mnemo.Infrastructure/Services/AuditService.cs` - Implementation
+- `sql/audit_events.sql` - Table creation and RLS policy
+
+**🧪 Test checkpoint 2.8:**
+- [x] Signup creates audit log entry
+- [x] Failed actions logged with error details
+- [x] Audit logs tenant-scoped via RLS
+
+### 2.9 User Deactivation ✅ COMPLETE
+- [x] `is_active` field enforced in `CurrentUserService` - reject inactive users
+- [x] Deactivated users with valid JWT cannot access API (returns null user context)
+- [x] `PATCH /tenant/users/{id}/deactivate` endpoint (admin only)
+- [x] `PATCH /tenant/users/{id}/reactivate` endpoint (admin only)
+- [x] Cannot deactivate yourself (self-deactivation blocked)
+- [x] All deactivation actions audit logged
+
+**🧪 Test checkpoint 2.9:**
+- [x] Deactivated user gets 401 on API calls (null user context)
+- [x] Admin can deactivate/reactivate users
+- [x] Deactivation logged in audit log
+
+### 2.10 Password Reset Flow ✅ COMPLETE
+- [x] Created `POST /auth/password-reset` endpoint that triggers Supabase reset
+- [x] Uses `/auth/v1/recover` Supabase endpoint
+- [x] Prevents email enumeration (always returns success message)
+- [x] Rate limited (5 requests per IP per hour)
+- [x] Audit logged (success/failure with user context if found)
+
+**Flow documented:**
+1. User requests reset via `POST /auth/password-reset` with email
+2. Supabase sends reset email with magic link
+3. User clicks link → redirected to set new password
+4. User sets password via Supabase Auth UI
+5. User can now log in with new password
+
+**🧪 Test checkpoint 2.10:**
+- [x] Password reset endpoint created and rate limited
+- [x] Audit logging includes reset requests
+- [x] Email enumeration prevented
+
+---
+
+## Phase 2 Complete! ✅
+
+All production auth security features implemented:
+- **Defense in depth**: Application-level filters + Database-level RLS
+- **Rate limiting**: Protects signup, invite, and general API endpoints
+- **Audit logging**: All auth events tracked with context
+- **User lifecycle**: Deactivation/reactivation with proper access control
+- **Password reset**: Secure flow via Supabase with email enumeration protection
+
+**All 13 tests passing.**
+
 ---
 
 ## Phase 3: Document Upload & Storage

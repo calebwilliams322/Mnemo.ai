@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Mnemo.Application.Services;
 using Mnemo.Domain.Enums;
 using Mnemo.Infrastructure.Persistence;
@@ -140,6 +141,18 @@ public class CurrentUserService : ICurrentUserService
 
         if (user != null)
         {
+            // SECURITY: Deactivated users cannot access the system
+            // They have valid Supabase tokens but we reject them at the application level
+            if (!user.IsActive)
+            {
+                // Log this attempt - user is trying to use a deactivated account
+                var logger = scope.ServiceProvider.GetRequiredService<ILogger<CurrentUserService>>();
+                logger.LogWarning(
+                    "Deactivated user attempted access: UserId={UserId}, Email={Email}",
+                    user.Id, user.Email);
+                return; // Leave all fields null - effectively unauthorized
+            }
+
             _userId = user.Id;
             _tenantId = user.TenantId;
             _role = user.Role;

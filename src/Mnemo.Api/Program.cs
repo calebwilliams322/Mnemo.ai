@@ -1,7 +1,9 @@
 using System.Net.Http.Json;
 using System.Text;
+using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Mnemo.Api.Authorization;
@@ -40,6 +42,9 @@ builder.Services.AddScoped<ICurrentUserService, CurrentUserService>();
 
 // Register Supabase Auth service
 builder.Services.AddScoped<ISupabaseAuthService, SupabaseAuthService>();
+
+// Register Audit service
+builder.Services.AddScoped<IAuditService, AuditService>();
 
 // Configure JWT Authentication with Supabase
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -85,6 +90,48 @@ builder.Services.AddAuthorization(options =>
 builder.Services.AddScoped<IAuthorizationHandler, TenantAuthorizationHandler>();
 builder.Services.AddScoped<IAuthorizationHandler, AdminAuthorizationHandler>();
 
+// Configure Rate Limiting
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    // Strict limit for signup - 5 requests per IP per hour
+    options.AddPolicy("signup", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 5,
+                Window = TimeSpan.FromHours(1),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0
+            }));
+
+    // Moderate limit for invites - 20 per user per hour
+    options.AddPolicy("invite", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.User.Identity?.Name ?? context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 20,
+                Window = TimeSpan.FromHours(1),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0
+            }));
+
+    // General API limit - 100 requests per user per minute
+    options.AddPolicy("api", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.User.Identity?.Name ?? context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 100,
+                Window = TimeSpan.FromMinutes(1),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0
+            }));
+});
+
 var app = builder.Build();
 
 // Configure middleware pipeline
@@ -96,6 +143,7 @@ if (app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 // Health check endpoint
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }))
@@ -108,18 +156,36 @@ app.MapGet("/health", () => Results.Ok(new { status = "healthy", timestamp = Dat
 app.MapPost("/auth/signup", async (
     SignupRequest request,
     ISupabaseAuthService supabaseAuth,
+    IAuditService auditService,
     MnemoDbContext db,
+    HttpContext httpContext,
     ILogger<Program> logger) =>
 {
+    // Capture request context for audit logging
+    var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString();
+    var userAgent = httpContext.Request.Headers.UserAgent.ToString();
+
     // Validate input
     if (string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
+    {
+        await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "invalid_email" });
         return Results.BadRequest("Valid email is required");
+    }
 
     if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length < 6)
+    {
+        await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "weak_password" });
         return Results.BadRequest("Password must be at least 6 characters");
+    }
 
     if (string.IsNullOrWhiteSpace(request.CompanyName))
+    {
+        await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "missing_company_name" });
         return Results.BadRequest("Company name is required");
+    }
 
     // Check if email already exists in our system
     var existingUser = await db.Users
@@ -127,7 +193,11 @@ app.MapPost("/auth/signup", async (
         .FirstOrDefaultAsync(u => u.Email == request.Email);
 
     if (existingUser != null)
+    {
+        await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "email_exists" });
         return Results.Conflict("An account with this email already exists");
+    }
 
     // Start a transaction
     await using var transaction = await db.Database.BeginTransactionAsync();
@@ -140,6 +210,8 @@ app.MapPost("/auth/signup", async (
         if (!supabaseResult.Success)
         {
             logger.LogWarning("Supabase user creation failed: {Error}", supabaseResult.Error);
+            await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
+                details: new { email = request.Email, reason = "supabase_error", error = supabaseResult.Error });
             return Results.BadRequest(supabaseResult.Error ?? "Failed to create account");
         }
 
@@ -179,6 +251,11 @@ app.MapPost("/auth/signup", async (
             "New tenant created: {TenantId} ({TenantName}) with admin user: {UserId} ({Email})",
             tenant.Id, tenant.Name, user.Id, user.Email);
 
+        // Log successful signup
+        await auditService.LogEventAsync("signup", "success",
+            tenantId: tenant.Id, userId: user.Id, ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, companyName = request.CompanyName });
+
         return Results.Created($"/me", new SignupResponse(
             tenant.Id,
             user.Id,
@@ -190,12 +267,58 @@ app.MapPost("/auth/signup", async (
         await transaction.RollbackAsync();
 
         logger.LogError(ex, "Failed to create tenant for {Email}", request.Email);
+        await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "exception", error = ex.Message });
         return Results.Problem("Failed to create account. Please try again.");
     }
 })
 .WithName("Signup")
 .WithTags("Auth")
-.AllowAnonymous();
+.AllowAnonymous()
+.RequireRateLimiting("signup");
+
+// POST /auth/password-reset - Request a password reset email
+app.MapPost("/auth/password-reset", async (
+    PasswordResetRequest request,
+    ISupabaseAuthService supabaseAuth,
+    IAuditService auditService,
+    MnemoDbContext db,
+    HttpContext httpContext,
+    ILogger<Program> logger) =>
+{
+    var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString();
+    var userAgent = httpContext.Request.Headers.UserAgent.ToString();
+
+    // Validate email format
+    if (string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
+    {
+        await auditService.LogEventAsync("password_reset", "failure", ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "invalid_email" });
+        return Results.BadRequest("Valid email is required");
+    }
+
+    // Check if user exists in our system (for logging purposes, not for response)
+    var user = await db.Users
+        .IgnoreQueryFilters()
+        .FirstOrDefaultAsync(u => u.Email == request.Email);
+
+    // Always send the reset email via Supabase if the email looks valid
+    // This prevents email enumeration attacks
+    var success = await supabaseAuth.SendPasswordResetAsync(request.Email);
+
+    // Log the attempt with user context if available
+    await auditService.LogEventAsync("password_reset", success ? "success" : "failure",
+        tenantId: user?.TenantId, userId: user?.Id, ipAddress: ipAddress, userAgent: userAgent,
+        details: new { email = request.Email, userExists = user != null });
+
+    // Always return success to prevent email enumeration
+    // Even if the email doesn't exist or Supabase fails
+    return Results.Ok(new { message = "If an account with that email exists, a password reset link has been sent." });
+})
+.WithName("RequestPasswordReset")
+.WithTags("Auth")
+.AllowAnonymous()
+.RequireRateLimiting("signup"); // Use signup rate limit - same strictness
 
 // ==================== User Endpoints ====================
 
@@ -225,7 +348,8 @@ app.MapGet("/me", async (
 })
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("GetCurrentUser")
-.WithTags("Users");
+.WithTags("Users")
+.RequireRateLimiting("api");
 
 // PATCH /me - Update current user profile
 app.MapPatch("/me", async (
@@ -259,7 +383,8 @@ app.MapPatch("/me", async (
 })
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("UpdateCurrentUser")
-.WithTags("Users");
+.WithTags("Users")
+.RequireRateLimiting("api");
 
 // GET /tenant/users - List users in current tenant (admin only)
 app.MapGet("/tenant/users", async (
@@ -284,29 +409,45 @@ app.MapGet("/tenant/users", async (
 })
 .RequireAuthorization(AuthorizationPolicies.RequireAdmin)
 .WithName("ListTenantUsers")
-.WithTags("Users");
+.WithTags("Users")
+.RequireRateLimiting("api");
 
 // POST /tenant/users/invite - Invite a user to the tenant (admin only)
 app.MapPost("/tenant/users/invite", async (
     InviteUserRequest request,
     ICurrentUserService currentUser,
     ISupabaseAuthService supabaseAuth,
+    IAuditService auditService,
     MnemoDbContext db,
+    HttpContext httpContext,
     ILogger<Program> logger) =>
 {
+    var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString();
+    var userAgent = httpContext.Request.Headers.UserAgent.ToString();
+
     if (!currentUser.TenantId.HasValue)
         return Results.Unauthorized();
 
     // Validate email
     if (string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
+    {
+        await auditService.LogEventAsync("invite", "failure",
+            tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "invalid_email" });
         return Results.BadRequest("Valid email is required");
+    }
 
     // Check if user already exists in this tenant
     var existingUser = await db.Users
         .FirstOrDefaultAsync(u => u.Email == request.Email && u.TenantId == currentUser.TenantId.Value);
 
     if (existingUser != null)
+    {
+        await auditService.LogEventAsync("invite", "failure",
+            tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "user_exists" });
         return Results.Conflict("User already exists in this tenant");
+    }
 
     try
     {
@@ -316,6 +457,9 @@ app.MapPost("/tenant/users/invite", async (
         if (!result.Success)
         {
             logger.LogWarning("Supabase invite failed: {Error}", result.Error);
+            await auditService.LogEventAsync("invite", "failure",
+                tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+                details: new { email = request.Email, reason = "supabase_error", error = result.Error });
             return Results.BadRequest(result.Error ?? "Failed to invite user");
         }
 
@@ -336,6 +480,11 @@ app.MapPost("/tenant/users/invite", async (
 
         logger.LogInformation("User {Email} invited to tenant {TenantId}", request.Email, currentUser.TenantId.Value);
 
+        // Log successful invite
+        await auditService.LogEventAsync("invite", "success",
+            tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+            details: new { invitedEmail = request.Email, invitedUserId = newUser.Id, role = request.Role });
+
         return Results.Ok(new InviteUserResponse(
             "Invitation sent successfully",
             request.Email));
@@ -343,12 +492,109 @@ app.MapPost("/tenant/users/invite", async (
     catch (Exception ex)
     {
         logger.LogError(ex, "Failed to invite user {Email}", request.Email);
+        await auditService.LogEventAsync("invite", "failure",
+            tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "exception", error = ex.Message });
         return Results.Problem("Failed to send invitation. Please try again.");
     }
 })
 .RequireAuthorization(AuthorizationPolicies.RequireAdmin)
 .WithName("InviteUser")
-.WithTags("Users");
+.WithTags("Users")
+.RequireRateLimiting("invite");
+
+// PATCH /tenant/users/{userId}/deactivate - Deactivate a user (admin only)
+app.MapPatch("/tenant/users/{userId:guid}/deactivate", async (
+    Guid userId,
+    ICurrentUserService currentUser,
+    IAuditService auditService,
+    MnemoDbContext db,
+    HttpContext httpContext,
+    ILogger<Program> logger) =>
+{
+    var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString();
+    var userAgent = httpContext.Request.Headers.UserAgent.ToString();
+
+    if (!currentUser.TenantId.HasValue || !currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    // Prevent self-deactivation
+    if (userId == currentUser.UserId.Value)
+    {
+        await auditService.LogEventAsync("user_deactivate", "failure",
+            tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+            details: new { targetUserId = userId, reason = "self_deactivation" });
+        return Results.BadRequest("Cannot deactivate your own account");
+    }
+
+    var targetUser = await db.Users
+        .FirstOrDefaultAsync(u => u.Id == userId && u.TenantId == currentUser.TenantId.Value);
+
+    if (targetUser == null)
+        return Results.NotFound("User not found");
+
+    if (!targetUser.IsActive)
+        return Results.BadRequest("User is already deactivated");
+
+    targetUser.IsActive = false;
+    targetUser.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    logger.LogInformation("User {UserId} deactivated by {AdminId}", userId, currentUser.UserId);
+
+    await auditService.LogEventAsync("user_deactivate", "success",
+        tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+        details: new { targetUserId = userId, targetEmail = targetUser.Email });
+
+    return Results.Ok(new { message = "User deactivated successfully", userId = targetUser.Id });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("DeactivateUser")
+.WithTags("Users")
+.RequireRateLimiting("api");
+
+// PATCH /tenant/users/{userId}/reactivate - Reactivate a user (admin only)
+app.MapPatch("/tenant/users/{userId:guid}/reactivate", async (
+    Guid userId,
+    ICurrentUserService currentUser,
+    IAuditService auditService,
+    MnemoDbContext db,
+    HttpContext httpContext,
+    ILogger<Program> logger) =>
+{
+    var ipAddress = httpContext.Connection.RemoteIpAddress?.ToString();
+    var userAgent = httpContext.Request.Headers.UserAgent.ToString();
+
+    if (!currentUser.TenantId.HasValue || !currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    // Need to query without the IsActive filter to find deactivated users
+    var targetUser = await db.Users
+        .IgnoreQueryFilters()
+        .FirstOrDefaultAsync(u => u.Id == userId && u.TenantId == currentUser.TenantId.Value);
+
+    if (targetUser == null)
+        return Results.NotFound("User not found");
+
+    if (targetUser.IsActive)
+        return Results.BadRequest("User is already active");
+
+    targetUser.IsActive = true;
+    targetUser.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    logger.LogInformation("User {UserId} reactivated by {AdminId}", userId, currentUser.UserId);
+
+    await auditService.LogEventAsync("user_reactivate", "success",
+        tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+        details: new { targetUserId = userId, targetEmail = targetUser.Email });
+
+    return Results.Ok(new { message = "User reactivated successfully", userId = targetUser.Id });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("ReactivateUser")
+.WithTags("Users")
+.RequireRateLimiting("api");
 
 app.Run();
 

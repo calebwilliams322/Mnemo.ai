@@ -23,6 +23,12 @@ public interface ISupabaseAuthService
     /// Used for cleanup when tenant/user creation fails.
     /// </summary>
     Task<bool> DeleteUserAsync(string supabaseUserId);
+
+    /// <summary>
+    /// Sends a password reset email to the user.
+    /// The user will receive an email with a link to reset their password.
+    /// </summary>
+    Task<bool> SendPasswordResetAsync(string email);
 }
 
 public class SupabaseUserResult

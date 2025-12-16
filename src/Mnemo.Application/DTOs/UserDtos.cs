@@ -25,3 +25,16 @@ public record InviteUserRequest(
 public record InviteUserResponse(
     string Message,
     string InvitedEmail);
+
+// Signup DTOs
+public record SignupRequest(
+    string Email,
+    string Password,
+    string CompanyName,
+    string? UserName = null);
+
+public record SignupResponse(
+    Guid TenantId,
+    Guid UserId,
+    string Email,
+    string Message);

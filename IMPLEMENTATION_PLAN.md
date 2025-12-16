@@ -194,49 +194,98 @@
 
 ---
 
-## Phase 2: Authentication & Authorization
+## Phase 2: Authentication & Authorization ✅ COMPLETE
 **Duration estimate: Security foundation**
 
-### 2.1 Supabase JWT Validation
-- [x] Configure JWT Bearer authentication with Supabase JWT secret
-- [x] Validate issuer, audience, signature, and expiry
-- [x] Create `CurrentUserService` that reads ALL user info from JWT claims:
-  - `sub` → Supabase user ID
-  - `email` → User email
-  - `tenant_id` → Tenant ID (from app_metadata)
-  - `role` → User role (from app_metadata)
-  - `user_id` → Internal user ID (from app_metadata)
-- [x] **Design decision:** Tenant ID stored in JWT claims, NOT looked up from DB
-  - Avoids circular dependency with query filters
-  - Standard approach for multi-tenant SaaS
-  - Requires setting app_metadata when user is created/invited
+### 2.1 Authentication Architecture (Production Pattern)
+- [x] **Design decision:** Database lookup on each request (NOT auth hooks)
+  - Standard pattern used by most production SaaS apps
+  - No dependency on beta features
+  - Role/tenant changes take effect immediately
+  - Works with any auth provider
+- [x] JWT contains only standard claims (`sub`, `email`) from Supabase
+- [x] `CurrentUserService` looks up user by `SupabaseUserId` to get `tenant_id`, `role`
+- [x] Uses `IgnoreQueryFilters()` to avoid circular dependency with tenant isolation
 
 **🧪 Test checkpoint 2.1:**
+- [x] User lookup works correctly from database
+- [x] Tenant and role resolved from DB, not JWT
+
+### 2.2 User Signup & Onboarding Flow
+- [x] New tenant signup flow via `POST /auth/signup`:
+  1. Endpoint validates email, password, company name
+  2. Creates Supabase user via Admin API
+  3. Creates tenant record in our DB
+  4. Creates user record linked to tenant with admin role
+  5. User logs in → `sub` claim in JWT → DB lookup gets tenant/role
+- [x] Invited user flow via `POST /tenant/users/invite`:
+  1. Admin invites user via endpoint
+  2. Creates user record in our DB with tenant_id
+  3. Supabase sends invite email
+  4. User clicks link, sets password
+  5. User logs in → DB lookup gets tenant/role
+- [x] `ISupabaseAuthService` created in `src/Mnemo.Infrastructure/Services/SupabaseAuthService.cs`
+
+**🧪 Test checkpoint 2.2:**
+- [x] Signup validation tests (email, password, company name)
+- [x] Duplicate email rejection test
+- [x] Full signup flow creates tenant and user in DB
+- [x] Integration test with real Supabase API
+
+### 2.3 JWT Validation & CurrentUserService
+- [x] Configure JWT Bearer authentication with Supabase JWT secret
+- [x] Validate issuer, audience, signature, and expiry
+- [x] Create `CurrentUserService` that:
+  - Reads `sub` (Supabase user ID) and `email` from JWT
+  - Looks up user in database by `SupabaseUserId`
+  - Returns `tenant_id`, `user_id`, `role` from database
+
+**🧪 Test checkpoint 2.3:**
 - [x] Valid JWT passes authentication
 - [x] Invalid/expired JWT returns 401
-- [x] User context (tenant, role) available from claims
+- [x] User context (tenant, role) resolved from database
 
-### 2.2 Authorization Policies
-- [x] Create `TenantAuthorizationHandler` - requires valid tenant in claims
-- [x] Create `AdminAuthorizationHandler` - requires admin role in claims
+### 2.4 Authorization Policies
+- [x] Create `TenantAuthorizationHandler` - requires valid tenant from DB lookup
+- [x] Create `AdminAuthorizationHandler` - requires admin role from DB lookup
 - [x] Global query filters on DbContext for automatic tenant isolation
 - [x] All tenant-scoped entities filtered by `CurrentTenantId`
 
-**🧪 Test checkpoint 2.2:**
-- [x] User without tenant in JWT cannot access tenant resources
+**🧪 Test checkpoint 2.4:**
+- [x] User not in DB cannot access tenant resources
 - [x] Admin can access admin-only endpoints
 - [x] Non-admin gets 403 on admin endpoints
+- [x] Cross-tenant isolation verified (Tenant A cannot see Tenant B data)
 
-### 2.3 User Endpoints
+### 2.5 User Endpoints
 - [x] `GET /me` - current user profile
 - [x] `PATCH /me` - update profile
 - [x] `GET /tenant/users` - list users (admin only)
 - [x] `POST /tenant/users/invite` - invite user via Supabase (admin only)
+- [x] `POST /auth/signup` - new tenant signup endpoint
 
-**🧪 Test checkpoint 2.3:**
-- [x] Integration tests for all user endpoints
-- [x] Auth flows work end-to-end
-- [x] Invite calls Supabase Admin API
+**🧪 Test checkpoint 2.5:**
+- [x] Integration tests for user endpoints (8 tests)
+- [x] Signup validation tests (5 tests)
+- [x] Full signup flow works with real Supabase API
+- [x] All 21 tests pass
+
+### End-to-End Flow Verified
+Manually tested the complete auth flow:
+1. `POST /auth/signup` → Creates Supabase user + tenant + user in DB
+2. Login via Supabase Auth API → Returns JWT with `sub` claim
+3. `GET /me` with JWT → CurrentUserService looks up user by `sub`, returns profile
+4. `GET /tenant/users` → Admin can list tenant users
+5. `PATCH /me` → User can update their profile
+6. **Tenant isolation confirmed** → Two separate tenants cannot see each other's data
+
+### Key Files Created
+- `src/Mnemo.Api/Services/CurrentUserService.cs` - Resolves user from JWT + DB lookup
+- `src/Mnemo.Api/Authorization/` - TenantAuthorizationHandler, AdminAuthorizationHandler
+- `src/Mnemo.Infrastructure/Services/SupabaseAuthService.cs` - Supabase Admin API client
+- `src/Mnemo.Application/Services/ICurrentUserService.cs` - Interface
+- `src/Mnemo.Application/Services/ISupabaseAuthService.cs` - Interface
+- `tests/Mnemo.Api.Tests/AuthenticationTests.cs` - 13 integration tests
 
 ---
 

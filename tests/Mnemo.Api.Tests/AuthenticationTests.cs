@@ -192,6 +192,220 @@ public class AuthenticationTests : IClassFixture<CustomWebApplicationFactory>, I
     }
 }
 
+/// <summary>
+/// Tests for the signup endpoint (/auth/signup).
+/// These test input validation and the full signup flow with real Supabase integration.
+/// </summary>
+public class SignupTests : IClassFixture<CustomWebApplicationFactory>
+{
+    private readonly CustomWebApplicationFactory _factory;
+
+    public SignupTests(CustomWebApplicationFactory factory)
+    {
+        _factory = factory;
+    }
+
+    [Fact]
+    public async Task Signup_WithInvalidEmail_ReturnsBadRequest()
+    {
+        using var client = _factory.CreateClient();
+
+        var request = new SignupRequest(
+            Email: "not-an-email",
+            Password: "password123",
+            CompanyName: "Test Company");
+
+        var response = await client.PostAsJsonAsync("/auth/signup", request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+    }
+
+    [Fact]
+    public async Task Signup_WithShortPassword_ReturnsBadRequest()
+    {
+        using var client = _factory.CreateClient();
+
+        var request = new SignupRequest(
+            Email: "test@example.com",
+            Password: "short",
+            CompanyName: "Test Company");
+
+        var response = await client.PostAsJsonAsync("/auth/signup", request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+    }
+
+    [Fact]
+    public async Task Signup_WithMissingCompanyName_ReturnsBadRequest()
+    {
+        using var client = _factory.CreateClient();
+
+        var request = new SignupRequest(
+            Email: "test@example.com",
+            Password: "password123",
+            CompanyName: "");
+
+        var response = await client.PostAsJsonAsync("/auth/signup", request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+    }
+
+    [Fact]
+    public async Task Signup_WithExistingEmail_ReturnsConflict()
+    {
+        // First, create a user with a known email
+        var existingEmail = $"existing_{Guid.NewGuid():N}@test.com";
+        var (tenant, user) = await CreateTestUserAsync(existingEmail);
+
+        try
+        {
+            using var client = _factory.CreateClient();
+
+            var request = new SignupRequest(
+                Email: existingEmail,
+                Password: "password123",
+                CompanyName: "Another Company");
+
+            var response = await client.PostAsJsonAsync("/auth/signup", request);
+
+            response.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        }
+        finally
+        {
+            await CleanupTestUserAsync(tenant.Id);
+        }
+    }
+
+    [Fact]
+    public async Task Signup_WithValidData_CreatesTenantAndUser()
+    {
+        // Generate unique email for this test
+        var testEmail = $"signuptest_{Guid.NewGuid():N}@test.com";
+        Guid? createdTenantId = null;
+        string? supabaseUserId = null;
+
+        try
+        {
+            using var client = _factory.CreateClient();
+
+            var request = new SignupRequest(
+                Email: testEmail,
+                Password: "TestPassword123!",
+                CompanyName: "Integration Test Company",
+                UserName: "Test User");
+
+            // Act
+            var response = await client.PostAsJsonAsync("/auth/signup", request);
+
+            // Assert
+            response.StatusCode.Should().Be(HttpStatusCode.Created);
+
+            var result = await response.Content.ReadFromJsonAsync<SignupResponse>();
+            result.Should().NotBeNull();
+            result!.Email.Should().Be(testEmail);
+            result.TenantId.Should().NotBeEmpty();
+            result.UserId.Should().NotBeEmpty();
+
+            createdTenantId = result.TenantId;
+
+            // Verify tenant and user were created in database
+            using var scope = _factory.Services.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<MnemoDbContext>();
+
+            var tenant = await dbContext.Tenants
+                .IgnoreQueryFilters()
+                .FirstOrDefaultAsync(t => t.Id == result.TenantId);
+            tenant.Should().NotBeNull();
+            tenant!.Name.Should().Be("Integration Test Company");
+
+            var user = await dbContext.Users
+                .IgnoreQueryFilters()
+                .FirstOrDefaultAsync(u => u.Id == result.UserId);
+            user.Should().NotBeNull();
+            user!.Email.Should().Be(testEmail);
+            user.Role.Should().Be(UserRole.Admin); // First user is admin
+            user.TenantId.Should().Be(result.TenantId);
+
+            supabaseUserId = user.SupabaseUserId;
+        }
+        finally
+        {
+            // Clean up: delete tenant/user from our DB
+            if (createdTenantId.HasValue)
+            {
+                await CleanupTestUserAsync(createdTenantId.Value);
+            }
+
+            // Clean up: delete user from Supabase
+            if (supabaseUserId != null)
+            {
+                await CleanupSupabaseUserAsync(supabaseUserId);
+            }
+        }
+    }
+
+    private async Task<(Tenant, User)> CreateTestUserAsync(string email)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<MnemoDbContext>();
+
+        var tenant = new Tenant
+        {
+            Id = Guid.NewGuid(),
+            Name = "Existing Tenant",
+            Plan = "free",
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var user = new User
+        {
+            Id = Guid.NewGuid(),
+            SupabaseUserId = Guid.NewGuid().ToString(),
+            Email = email,
+            Role = UserRole.Admin,
+            TenantId = tenant.Id,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        dbContext.Tenants.Add(tenant);
+        dbContext.Users.Add(user);
+        await dbContext.SaveChangesAsync();
+
+        return (tenant, user);
+    }
+
+    private async Task CleanupTestUserAsync(Guid tenantId)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<MnemoDbContext>();
+
+        var users = await dbContext.Users
+            .IgnoreQueryFilters()
+            .Where(u => u.TenantId == tenantId)
+            .ToListAsync();
+        dbContext.Users.RemoveRange(users);
+
+        var tenant = await dbContext.Tenants.FindAsync(tenantId);
+        if (tenant != null)
+            dbContext.Tenants.Remove(tenant);
+
+        await dbContext.SaveChangesAsync();
+    }
+
+    private async Task CleanupSupabaseUserAsync(string supabaseUserId)
+    {
+        // Use the Supabase admin API to delete the test user
+        using var scope = _factory.Services.CreateScope();
+        var supabaseAuth = scope.ServiceProvider
+            .GetRequiredService<Mnemo.Application.Services.ISupabaseAuthService>();
+
+        await supabaseAuth.DeleteUserAsync(supabaseUserId);
+    }
+}
+
 public class CustomWebApplicationFactory : WebApplicationFactory<Program>
 {
     private const string TestJwtSecret = "b+q0KEu4J51XBre65LkZvZg73Afh1f1W0ZjBS7C69xONJv/2WoyJ18zTEkALkOqoE+r5FuQ91VIHMT7JQU9NAA==";
@@ -305,24 +519,31 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>
         await dbContext.SaveChangesAsync();
     }
 
+    /// <summary>
+    /// Generates a test JWT token that mimics what Supabase produces.
+    /// Only contains standard claims (sub, email) - tenant/role comes from DB lookup.
+    /// </summary>
     public string GenerateTestToken(User user, Guid tenantId)
     {
-        // Must match how Program.cs validates: Encoding.UTF8.GetBytes(jwtSecret)
+        // tenantId parameter kept for API compatibility but not used in token
+        // (tenant info is looked up from database based on SupabaseUserId)
+        return GenerateTestToken(user);
+    }
+
+    public string GenerateTestToken(User user)
+    {
         var keyBytes = Encoding.UTF8.GetBytes(TestJwtSecret);
         var securityKey = new SymmetricSecurityKey(keyBytes);
         var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
 
-        // Include all necessary claims - this is what Supabase would include via app_metadata
+        // Standard Supabase JWT claims - NO custom claims needed
+        // CurrentUserService looks up tenant_id and role from database
         var claims = new[]
         {
             new Claim(JwtRegisteredClaimNames.Sub, user.SupabaseUserId!),
             new Claim(JwtRegisteredClaimNames.Email, user.Email),
             new Claim("aud", "authenticated"),
-            new Claim("role", "authenticated"),
-            // Custom claims from app_metadata
-            new Claim("tenant_id", tenantId.ToString()),
-            new Claim("user_id", user.Id.ToString()),
-            new Claim("user_role", user.Role)
+            new Claim("role", "authenticated")
         };
 
         var token = new JwtSecurityToken(

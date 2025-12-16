@@ -11,11 +11,28 @@
 | Testing | **Full coverage** | Unit + integration tests for everything |
 
 ## Reference Documents
-- `/Users/calebwilliams/Insurance/MnemoInsurance/DESIGN_NOTES.md`
-- `/Users/calebwilliams/Insurance/MnemoInsurance/DATA_MODEL.md`
-- `/Users/calebwilliams/Insurance/MnemoInsurance/EXTRACTION_STRATEGY.md`
-- `/Users/calebwilliams/Insurance/MnemoInsurance/API_DESIGN.md`
-- `/Users/calebwilliams/Insurance/MnemoInsurance/WIREFRAMES.md`
+- `/Users/calebwilliams/Insurance/Mnemo/DESIGN_NOTES.md`
+- `/Users/calebwilliams/Insurance/Mnemo/DATA_MODEL.md`
+- `/Users/calebwilliams/Insurance/Mnemo/EXTRACTION_STRATEGY.md`
+- `/Users/calebwilliams/Insurance/Mnemo/API_DESIGN.md`
+- `/Users/calebwilliams/Insurance/Mnemo/WIREFRAMES.md`
+
+## Git Branching Strategy
+- Each phase should be developed on a new branch: `phase-X-description`
+- Example: `phase-0-project-setup`, `phase-1-database-schema`
+- **Ask user before merging to main** - Do not merge without explicit approval
+- Create PR for each phase to document changes
+
+## ⚠️ IMPORTANT: Execution Guidelines
+1. **STRICTLY follow phases in order** - Do not skip ahead or work on future phases
+2. **Complete each sub-task before moving to the next** - No jumping around within a phase
+3. **Check for existing infrastructure first** - Some components may already exist:
+   - Supabase project with database schema already created
+   - Some tables may already have data
+   - Supabase Storage bucket may be configured (switched from R2)
+   - Environment files (.env) already exist
+4. **Verify existing work before recreating** - Adapt to what's already in place
+5. **Mark checkpoints as complete only after verification**
 
 ---
 
@@ -763,7 +780,7 @@ When resuming this project, use this prompt to get Claude up to speed:
 ```
 I'm continuing work on Mnemo Insurance, an AI-powered policy intelligence platform for insurance brokerages.
 
-The project design documents are in /Users/calebwilliams/Insurance/MnemoInsurance/:
+The project design documents are in /Users/calebwilliams/Insurance/Mnemo/:
 - DESIGN_NOTES.md - Overall vision, stack, decisions
 - DATA_MODEL.md - PostgreSQL + pgvector schema
 - EXTRACTION_STRATEGY.md - 6-stage PDF extraction pipeline

@@ -1,12 +1,23 @@
 using Microsoft.EntityFrameworkCore;
+using Mnemo.Application.Services;
 using Mnemo.Domain.Entities;
 
 namespace Mnemo.Infrastructure.Persistence;
 
 public class MnemoDbContext : DbContext
 {
+    private readonly ICurrentUserService? _currentUserService;
+
+    // Property that gets evaluated at query time, not model-building time
+    private Guid? CurrentTenantId => _currentUserService?.TenantId;
+
     public MnemoDbContext(DbContextOptions<MnemoDbContext> options) : base(options)
     {
+    }
+
+    public MnemoDbContext(DbContextOptions<MnemoDbContext> options, ICurrentUserService currentUser) : base(options)
+    {
+        _currentUserService = currentUser;
     }
 
     public DbSet<Tenant> Tenants => Set<Tenant>();
@@ -68,6 +79,19 @@ public class MnemoDbContext : DbContext
         ConfigureMessage(modelBuilder);
         ConfigureWebhook(modelBuilder);
         ConfigureWebhookDelivery(modelBuilder);
+
+        // Global query filters for tenant isolation
+        // All tenant-scoped entities automatically filter by current tenant
+        modelBuilder.Entity<User>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<Document>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<Policy>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<SubmissionGroup>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<ContractRequirement>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<ComplianceCheck>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<Conversation>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<Webhook>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        // Note: Tenant, IndustryBenchmark are not tenant-scoped (shared or root)
+        // Note: DocumentChunk, Coverage, Message, WebhookDelivery are accessed via parent entities
     }
 
     private static void ConfigureTenant(ModelBuilder modelBuilder)

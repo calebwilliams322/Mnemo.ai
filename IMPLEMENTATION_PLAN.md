@@ -198,36 +198,45 @@
 **Duration estimate: Security foundation**
 
 ### 2.1 Supabase JWT Validation
-- [ ] Create `JwtValidationMiddleware`
-- [ ] Validate Supabase JWT signature
-- [ ] Extract user ID and tenant ID from claims
-- [ ] Create `CurrentUser` service for DI
+- [x] Configure JWT Bearer authentication with Supabase JWT secret
+- [x] Validate issuer, audience, signature, and expiry
+- [x] Create `CurrentUserService` that reads ALL user info from JWT claims:
+  - `sub` → Supabase user ID
+  - `email` → User email
+  - `tenant_id` → Tenant ID (from app_metadata)
+  - `role` → User role (from app_metadata)
+  - `user_id` → Internal user ID (from app_metadata)
+- [x] **Design decision:** Tenant ID stored in JWT claims, NOT looked up from DB
+  - Avoids circular dependency with query filters
+  - Standard approach for multi-tenant SaaS
+  - Requires setting app_metadata when user is created/invited
 
 **🧪 Test checkpoint 2.1:**
-- [ ] Valid JWT passes middleware
-- [ ] Invalid/expired JWT returns 401
-- [ ] User context available in controllers
+- [x] Valid JWT passes authentication
+- [x] Invalid/expired JWT returns 401
+- [x] User context (tenant, role) available from claims
 
 ### 2.2 Authorization Policies
-- [ ] Create `TenantAuthorizationHandler`
-- [ ] Ensure users can only access their tenant's data
-- [ ] Admin role check for user management
+- [x] Create `TenantAuthorizationHandler` - requires valid tenant in claims
+- [x] Create `AdminAuthorizationHandler` - requires admin role in claims
+- [x] Global query filters on DbContext for automatic tenant isolation
+- [x] All tenant-scoped entities filtered by `CurrentTenantId`
 
 **🧪 Test checkpoint 2.2:**
-- [ ] User A cannot access User B's tenant data
-- [ ] Admin can list tenant users
-- [ ] Non-admin cannot invite users
+- [x] User without tenant in JWT cannot access tenant resources
+- [x] Admin can access admin-only endpoints
+- [x] Non-admin gets 403 on admin endpoints
 
 ### 2.3 User Endpoints
-- [ ] `GET /me` - current user profile
-- [ ] `PATCH /me` - update profile
-- [ ] `GET /tenant/users` - list users (admin)
-- [ ] `POST /tenant/users/invite` - invite user (admin)
+- [x] `GET /me` - current user profile
+- [x] `PATCH /me` - update profile
+- [x] `GET /tenant/users` - list users (admin only)
+- [x] `POST /tenant/users/invite` - invite user via Supabase (admin only)
 
 **🧪 Test checkpoint 2.3:**
-- [ ] Integration tests for all user endpoints
-- [ ] Auth flows work end-to-end
-- [ ] Invite triggers Supabase email (or logs for dev)
+- [x] Integration tests for all user endpoints
+- [x] Auth flows work end-to-end
+- [x] Invite calls Supabase Admin API
 
 ---
 

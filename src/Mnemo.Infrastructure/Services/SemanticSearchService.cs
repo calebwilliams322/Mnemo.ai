@@ -1,14 +1,15 @@
-using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Mnemo.Application.Services;
 using Mnemo.Infrastructure.Persistence;
-using Npgsql;
+using Pgvector;
+using Pgvector.EntityFrameworkCore;
 
 namespace Mnemo.Infrastructure.Services;
 
 /// <summary>
 /// Semantic search service using pgvector for similarity search.
+/// Uses EF Core LINQ with pgvector extension methods for clean, type-safe queries.
 /// </summary>
 public class SemanticSearchService : ISemanticSearchService
 {
@@ -36,125 +37,78 @@ public class SemanticSearchService : ISemanticSearchService
             request.PolicyIds?.Count ?? 0,
             request.DocumentIds?.Count ?? 0);
 
-        var results = new List<ChunkSearchResult>();
+        // Convert float[] to pgvector Vector type
+        var queryVector = new Vector(request.QueryEmbedding);
 
-        // Build the query based on filters
-        var sql = BuildSearchQuery(request);
+        // Build the base query with tenant filter and non-null embeddings
+        var query = _dbContext.DocumentChunks
+            .Include(c => c.Document)
+            .Where(c => c.Document.TenantId == request.TenantId)
+            .Where(c => c.Embedding != null);
 
-        var connection = (NpgsqlConnection)_dbContext.Database.GetDbConnection();
-        await connection.OpenAsync(ct);
-
-        try
+        // Apply document filter if specified
+        if (request.DocumentIds?.Count > 0)
         {
-            await using var cmd = new NpgsqlCommand(sql, connection);
+            query = query.Where(c => request.DocumentIds.Contains(c.DocumentId));
+        }
 
-            // Add parameters - convert vector to string format for pgvector
-            // Format: '[0.1,0.2,0.3,...]' - use InvariantCulture to ensure consistent decimal separator
-            var vectorString = "[" + string.Join(",", request.QueryEmbedding.Select(f => f.ToString(CultureInfo.InvariantCulture))) + "]";
+        // Apply policy filter if specified (documents linked to policies)
+        if (request.PolicyIds?.Count > 0)
+        {
+            var policyDocumentIds = await _dbContext.Policies
+                .Where(p => request.PolicyIds.Contains(p.Id) && p.SourceDocumentId != null)
+                .Select(p => p.SourceDocumentId!.Value)
+                .ToListAsync(ct);
 
-            _logger.LogDebug("Query vector (first 100 chars): {VectorPrefix}...",
-                vectorString.Length > 100 ? vectorString[..100] : vectorString);
-            _logger.LogDebug("Query vector length: {Length}, dimensions: {Dims}",
-                vectorString.Length, request.QueryEmbedding.Length);
-
-            cmd.Parameters.AddWithValue("@queryEmbedding", vectorString);
-            cmd.Parameters.AddWithValue("@tenantId", request.TenantId);
-            cmd.Parameters.AddWithValue("@minSimilarity", request.MinSimilarity);
-            cmd.Parameters.AddWithValue("@topK", request.TopK);
-
-            if (request.PolicyIds?.Count > 0)
+            if (policyDocumentIds.Count > 0)
             {
-                cmd.Parameters.AddWithValue("@policyIds", request.PolicyIds.ToArray());
-            }
-
-            if (request.DocumentIds?.Count > 0)
-            {
-                cmd.Parameters.AddWithValue("@documentIds", request.DocumentIds.ToArray());
-            }
-
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-
-            while (await reader.ReadAsync(ct))
-            {
-                results.Add(new ChunkSearchResult
-                {
-                    ChunkId = reader.GetGuid(reader.GetOrdinal("chunk_id")),
-                    DocumentId = reader.GetGuid(reader.GetOrdinal("document_id")),
-                    DocumentName = reader.GetString(reader.GetOrdinal("file_name")),
-                    ChunkText = reader.GetString(reader.GetOrdinal("chunk_text")),
-                    ChunkIndex = reader.GetInt32(reader.GetOrdinal("chunk_index")),
-                    PageStart = reader.IsDBNull(reader.GetOrdinal("page_start"))
-                        ? null
-                        : reader.GetInt32(reader.GetOrdinal("page_start")),
-                    PageEnd = reader.IsDBNull(reader.GetOrdinal("page_end"))
-                        ? null
-                        : reader.GetInt32(reader.GetOrdinal("page_end")),
-                    SectionType = reader.IsDBNull(reader.GetOrdinal("section_type"))
-                        ? null
-                        : reader.GetString(reader.GetOrdinal("section_type")),
-                    Similarity = reader.GetDouble(reader.GetOrdinal("similarity"))
-                });
+                query = query.Where(c => policyDocumentIds.Contains(c.DocumentId));
             }
         }
-        finally
-        {
-            await connection.CloseAsync();
-        }
+
+        // Use pgvector cosine distance for similarity search
+        // CosineDistance returns 0 for identical vectors, 2 for opposite
+        // Similarity = 1 - distance (for normalized vectors)
+        var results = await query
+            .OrderBy(c => c.Embedding!.CosineDistance(queryVector))
+            .Take(request.TopK * 2) // Fetch extra to allow for filtering
+            .Select(c => new
+            {
+                c.Id,
+                c.DocumentId,
+                c.Document.FileName,
+                c.ChunkText,
+                c.ChunkIndex,
+                c.PageStart,
+                c.PageEnd,
+                c.SectionType,
+                Distance = c.Embedding!.CosineDistance(queryVector)
+            })
+            .ToListAsync(ct);
+
+        // Convert to ChunkSearchResult and filter by similarity threshold
+        var searchResults = results
+            .Select(r => new ChunkSearchResult
+            {
+                ChunkId = r.Id,
+                DocumentId = r.DocumentId,
+                DocumentName = r.FileName,
+                ChunkText = r.ChunkText,
+                ChunkIndex = r.ChunkIndex,
+                PageStart = r.PageStart,
+                PageEnd = r.PageEnd,
+                SectionType = r.SectionType,
+                Similarity = 1 - r.Distance // Convert distance to similarity
+            })
+            .Where(r => r.Similarity >= request.MinSimilarity)
+            .Take(request.TopK)
+            .ToList();
 
         _logger.LogInformation(
             "Semantic search returned {ResultCount} results, top similarity: {TopSimilarity:F3}",
-            results.Count,
-            results.FirstOrDefault()?.Similarity ?? 0);
+            searchResults.Count,
+            searchResults.FirstOrDefault()?.Similarity ?? 0);
 
-        return results;
-    }
-
-    private static string BuildSearchQuery(SemanticSearchRequest request)
-    {
-        var hasDocumentFilter = request.DocumentIds?.Count > 0;
-        var hasPolicyFilter = request.PolicyIds?.Count > 0;
-
-        // Build WHERE clause conditions
-        // Cast @queryEmbedding to vector type for pgvector comparison
-        var conditions = new List<string>
-        {
-            "d.tenant_id = @tenantId",
-            "dc.embedding IS NOT NULL",
-            "1 - (dc.embedding <=> @queryEmbedding::vector) >= @minSimilarity"
-        };
-
-        if (hasDocumentFilter)
-        {
-            conditions.Add("dc.document_id = ANY(@documentIds)");
-        }
-
-        if (hasPolicyFilter)
-        {
-            // Filter by documents that are source documents for the specified policies
-            conditions.Add(@"dc.document_id IN (
-                SELECT source_document_id FROM policies
-                WHERE id = ANY(@policyIds) AND source_document_id IS NOT NULL
-            )");
-        }
-
-        var whereClause = string.Join(" AND ", conditions);
-
-        return $@"
-            SELECT
-                dc.id as chunk_id,
-                dc.document_id,
-                d.file_name,
-                dc.chunk_text,
-                dc.chunk_index,
-                dc.page_start,
-                dc.page_end,
-                dc.section_type,
-                1 - (dc.embedding <=> @queryEmbedding::vector) as similarity
-            FROM document_chunks dc
-            INNER JOIN documents d ON dc.document_id = d.id
-            WHERE {whereClause}
-            ORDER BY dc.embedding <=> @queryEmbedding::vector
-            LIMIT @topK
-        ";
+        return searchResults;
     }
 }

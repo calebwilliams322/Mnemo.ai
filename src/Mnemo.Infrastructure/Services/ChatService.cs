@@ -37,6 +37,25 @@ public partial class ChatService : IChatService
     private readonly ILogger<ChatService> _logger;
     private readonly ChatSettings _settings;
 
+    /// <summary>
+    /// Patterns that indicate a message doesn't need RAG lookup (greetings, acknowledgments).
+    /// </summary>
+    private static readonly string[] SkipRagPatterns =
+    [
+        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "got it",
+        "understood", "great", "perfect", "awesome", "cool", "bye", "goodbye",
+        "yes", "no", "sure", "yep", "nope", "alright", "sounds good"
+    ];
+
+    /// <summary>
+    /// Patterns that indicate a follow-up question that can use existing context.
+    /// </summary>
+    private static readonly string[] FollowUpPatterns =
+    [
+        "what about", "and the", "how about", "what else", "tell me more",
+        "explain", "why", "how", "can you", "could you", "please"
+    ];
+
     public ChatService(
         MnemoDbContext dbContext,
         ICurrentUserService currentUser,
@@ -53,6 +72,34 @@ public partial class ChatService : IChatService
         _claudeChat = claudeChat;
         _settings = settings.Value;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Determines if RAG lookup should be performed for this message.
+    /// Skips RAG for simple greetings, acknowledgments, and short follow-ups.
+    /// </summary>
+    private static bool ShouldPerformRagLookup(string message, int existingMessageCount)
+    {
+        var lowerMessage = message.ToLowerInvariant().Trim();
+
+        // Skip RAG for simple greetings and acknowledgments
+        if (SkipRagPatterns.Any(p => lowerMessage == p || lowerMessage == p + "!" || lowerMessage == p + "."))
+        {
+            return false;
+        }
+
+        // Skip RAG for very short follow-up questions in existing conversations
+        // These can typically be answered from context already in the conversation
+        if (existingMessageCount > 0 && lowerMessage.Length < 25)
+        {
+            if (FollowUpPatterns.Any(p => lowerMessage.StartsWith(p)))
+            {
+                return false;
+            }
+        }
+
+        // For everything else, perform RAG lookup
+        return true;
     }
 
     public async IAsyncEnumerable<ChatStreamResult> SendMessageAsync(
@@ -92,54 +139,79 @@ public partial class ChatService : IChatService
         _dbContext.Messages.Add(userMsg);
         await _dbContext.SaveChangesAsync(ct);
 
-        // 3. Embed user query
-        var embeddingResult = await _embeddingService.GenerateEmbeddingAsync(userMessage);
-        if (!embeddingResult.Success || embeddingResult.Embeddings.Count == 0)
+        // 3. Determine if RAG lookup is needed (skip for greetings, simple follow-ups)
+        var existingMessageCount = conversation.Messages.Count;
+        var performRag = ShouldPerformRagLookup(userMessage, existingMessageCount);
+
+        List<ChunkSearchResult> relevantChunks = [];
+
+        if (performRag)
         {
-            yield return new ChatStreamResult
+            // 4. Embed user query
+            var embeddingResult = await _embeddingService.GenerateEmbeddingAsync(userMessage);
+            if (!embeddingResult.Success || embeddingResult.Embeddings.Count == 0)
             {
-                Type = "error",
-                Error = "Failed to generate query embedding"
+                yield return new ChatStreamResult
+                {
+                    Type = "error",
+                    Error = "Failed to generate query embedding"
+                };
+                yield break;
+            }
+
+            // 5. Semantic search for relevant chunks
+            var policyIds = ParseGuidArray(conversation.PolicyIds);
+            var documentIds = ParseGuidArray(conversation.DocumentIds);
+
+            var searchRequest = new SemanticSearchRequest
+            {
+                QueryEmbedding = embeddingResult.Embeddings[0],
+                TenantId = _currentUser.TenantId!.Value,
+                PolicyIds = policyIds.Count > 0 ? policyIds : null,
+                DocumentIds = documentIds.Count > 0 ? documentIds : null,
+                TopK = _settings.MaxContextChunks,
+                MinSimilarity = _settings.MinSimilarity
             };
-            yield break;
+
+            relevantChunks = await _semanticSearch.SearchAsync(searchRequest, ct);
+
+            _logger.LogInformation(
+                "Found {ChunkCount} relevant chunks for query",
+                relevantChunks.Count);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Skipping RAG lookup for message (greeting/simple follow-up)");
         }
 
-        // 4. Semantic search for relevant chunks
-        var policyIds = ParseGuidArray(conversation.PolicyIds);
-        var documentIds = ParseGuidArray(conversation.DocumentIds);
+        // 6. Build message history for Claude (proper multi-turn format)
+        var chatMessages = new List<ChatMessage>();
 
-        var searchRequest = new SemanticSearchRequest
-        {
-            QueryEmbedding = embeddingResult.Embeddings[0],
-            TenantId = _currentUser.TenantId!.Value,
-            PolicyIds = policyIds.Count > 0 ? policyIds : null,
-            DocumentIds = documentIds.Count > 0 ? documentIds : null,
-            TopK = _settings.MaxContextChunks,
-            MinSimilarity = _settings.MinSimilarity
-        };
-
-        var relevantChunks = await _semanticSearch.SearchAsync(searchRequest, ct);
-
-        _logger.LogInformation(
-            "Found {ChunkCount} relevant chunks for query",
-            relevantChunks.Count);
-
-        // 5. Build RAG prompt
+        // Add conversation history as separate messages (last N messages)
         var recentMessages = conversation.Messages
             .TakeLast(_settings.MaxHistoryMessages)
-            .Select(m => (m.Role, m.Content))
             .ToList();
 
-        var contextPrompt = ChatPrompts.BuildUserMessage(
-            relevantChunks,
-            recentMessages,
-            userMessage);
-
-        // 6. Build message history for Claude
-        var chatMessages = new List<ChatMessage>
+        foreach (var msg in recentMessages)
         {
-            new() { Role = "user", Content = contextPrompt }
-        };
+            chatMessages.Add(new ChatMessage
+            {
+                Role = msg.Role,
+                Content = msg.Content
+            });
+        }
+
+        // 7. Build the current user message with RAG context (if applicable)
+        var currentUserContent = relevantChunks.Count > 0
+            ? ChatPrompts.BuildContextPrompt(relevantChunks, userMessage)
+            : userMessage;
+
+        chatMessages.Add(new ChatMessage
+        {
+            Role = "user",
+            Content = currentUserContent
+        });
 
         var chatRequest = new ChatRequest
         {
@@ -148,7 +220,7 @@ public partial class ChatService : IChatService
             MaxTokens = _settings.MaxResponseTokens
         };
 
-        // 7. Stream response from Claude
+        // 8. Stream response from Claude
         var responseBuilder = new StringBuilder();
         var inputTokens = 0;
         var outputTokens = 0;

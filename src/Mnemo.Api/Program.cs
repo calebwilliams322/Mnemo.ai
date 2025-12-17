@@ -228,6 +228,20 @@ builder.Services.AddRateLimiter(options =>
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
                 QueueLimit = 0
             }));
+
+    // Stricter limit for expensive chat operations - 20 requests per user per minute
+    // Uses sliding window for smoother rate limiting (better for bursty chat usage)
+    options.AddPolicy("chat", context =>
+        RateLimitPartition.GetSlidingWindowLimiter(
+            partitionKey: context.User.Identity?.Name ?? GetClientIp(context),
+            factory: _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 20,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 4, // 15-second segments for smoother limiting
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 2 // Allow small queue for burst tolerance
+            }));
 });
 
 var app = builder.Build();
@@ -1697,7 +1711,7 @@ app.MapPost("/conversations", async (
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("CreateConversation")
 .WithTags("Chat")
-.RequireRateLimiting("api");
+.RequireRateLimiting("chat");
 
 // GET /conversations - List user's conversations
 app.MapGet("/conversations", async (
@@ -1763,7 +1777,7 @@ app.MapPost("/conversations/{id:guid}/messages", async (
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("SendMessage")
 .WithTags("Chat")
-.RequireRateLimiting("api");
+.RequireRateLimiting("chat");
 
 // GET /conversations/{id}/messages - Get message history
 app.MapGet("/conversations/{id:guid}/messages", async (

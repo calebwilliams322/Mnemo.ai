@@ -22,6 +22,9 @@ public class ChatSettings
     public double MinSimilarity { get; set; } = 0.7;
     public int MaxHistoryMessages { get; set; } = 10;
     public int MaxResponseTokens { get; set; } = 2048;
+    public int MaxMessageLength { get; set; } = 10000;
+    public int EmbeddingTimeoutSeconds { get; set; } = 30;
+    public int SemanticSearchTimeoutSeconds { get; set; } = 15;
 }
 
 /// <summary>
@@ -55,6 +58,11 @@ public partial class ChatService : IChatService
         "what about", "and the", "how about", "what else", "tell me more",
         "explain", "why", "how", "can you", "could you", "please"
     ];
+
+    /// <summary>
+    /// Expected embedding dimension for text-embedding-3-small model.
+    /// </summary>
+    private const int ExpectedEmbeddingDimension = 1536;
 
     public ChatService(
         MnemoDbContext dbContext,
@@ -111,6 +119,30 @@ public partial class ChatService : IChatService
             "Processing chat message for conversation {ConversationId}",
             conversationId);
 
+        // 0. Input validation
+        if (string.IsNullOrWhiteSpace(userMessage))
+        {
+            yield return new ChatStreamResult
+            {
+                Type = "error",
+                Error = "Message cannot be empty"
+            };
+            yield break;
+        }
+
+        if (userMessage.Length > _settings.MaxMessageLength)
+        {
+            _logger.LogWarning(
+                "Message exceeds max length: {Length} > {Max}",
+                userMessage.Length, _settings.MaxMessageLength);
+            yield return new ChatStreamResult
+            {
+                Type = "error",
+                Error = $"Message exceeds maximum length of {_settings.MaxMessageLength:N0} characters"
+            };
+            yield break;
+        }
+
         // 1. Load conversation with context
         var conversation = await _dbContext.Conversations
             .Include(c => c.Messages.OrderBy(m => m.CreatedAt))
@@ -151,28 +183,65 @@ public partial class ChatService : IChatService
         var performRag = ShouldPerformRagLookup(userMessage, existingMessageCount);
 
         List<ChunkSearchResult> relevantChunks = [];
+        var searchFailed = false;
+        string? embeddingError = null;
 
         if (performRag)
         {
-            // 4. Embed user query
-            var embeddingResult = await _embeddingService.GenerateEmbeddingAsync(userMessage);
-            if (!embeddingResult.Success || embeddingResult.Embeddings.Count == 0)
+            // 5. Embed user query (with timeout)
+            float[]? queryEmbedding = null;
+            try
+            {
+                using var embeddingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                embeddingCts.CancelAfter(TimeSpan.FromSeconds(_settings.EmbeddingTimeoutSeconds));
+
+                var embeddingResult = await _embeddingService.GenerateEmbeddingAsync(userMessage);
+
+                if (!embeddingResult.Success || embeddingResult.Embeddings.Count == 0)
+                {
+                    embeddingError = "Failed to generate query embedding";
+                }
+                else
+                {
+                    queryEmbedding = embeddingResult.Embeddings[0];
+
+                    // Validate embedding dimension
+                    if (queryEmbedding.Length != ExpectedEmbeddingDimension)
+                    {
+                        _logger.LogError(
+                            "Embedding dimension mismatch: expected {Expected}, got {Actual}",
+                            ExpectedEmbeddingDimension, queryEmbedding.Length);
+                        embeddingError = "Embedding service configuration error";
+                        queryEmbedding = null;
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "Embedding generation timed out after {Timeout}s",
+                    _settings.EmbeddingTimeoutSeconds);
+                embeddingError = "Query processing timed out. Please try again.";
+            }
+
+            // Handle embedding errors (yield outside try-catch)
+            if (embeddingError != null)
             {
                 yield return new ChatStreamResult
                 {
                     Type = "error",
-                    Error = "Failed to generate query embedding"
+                    Error = embeddingError
                 };
                 yield break;
             }
 
-            // 5. Semantic search for relevant chunks
+            // 6. Semantic search for relevant chunks (with timeout + graceful degradation)
             var policyIds = ParseGuidArray(conversation.PolicyIds);
             var documentIds = ParseGuidArray(conversation.DocumentIds);
 
             var searchRequest = new SemanticSearchRequest
             {
-                QueryEmbedding = embeddingResult.Embeddings[0],
+                QueryEmbedding = queryEmbedding!,
                 TenantId = _currentUser.TenantId!.Value,
                 PolicyIds = policyIds.Count > 0 ? policyIds : null,
                 DocumentIds = documentIds.Count > 0 ? documentIds : null,
@@ -180,11 +249,37 @@ public partial class ChatService : IChatService
                 MinSimilarity = _settings.MinSimilarity
             };
 
-            relevantChunks = await _semanticSearch.SearchAsync(searchRequest, ct);
+            try
+            {
+                using var searchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                searchCts.CancelAfter(TimeSpan.FromSeconds(_settings.SemanticSearchTimeoutSeconds));
 
-            _logger.LogInformation(
-                "Found {ChunkCount} relevant chunks for query",
-                relevantChunks.Count);
+                relevantChunks = await _semanticSearch.SearchAsync(searchRequest, searchCts.Token);
+
+                _logger.LogInformation(
+                    "Found {ChunkCount} relevant chunks for query",
+                    relevantChunks.Count);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                // Graceful degradation: continue without RAG context
+                _logger.LogWarning(ex,
+                    "Semantic search failed for conversation {ConversationId}, continuing without RAG context",
+                    conversationId);
+                searchFailed = true;
+                relevantChunks = [];
+            }
+
+            // Notify client of degraded mode (yield outside try-catch)
+            if (searchFailed)
+            {
+                yield return new ChatStreamResult
+                {
+                    Type = "warning",
+                    Error = "Document search unavailable. Response may lack specific document context.",
+                    DegradedMode = true
+                };
+            }
         }
         else
         {
@@ -199,7 +294,9 @@ public partial class ChatService : IChatService
         // 8. Build the current user message with RAG context (if applicable)
         var currentUserContent = relevantChunks.Count > 0
             ? ChatPrompts.BuildContextPrompt(relevantChunks, userMessage)
-            : userMessage;
+            : searchFailed
+                ? $"[Note: Document search is temporarily unavailable. Please answer based on general knowledge about insurance policies.]\n\n{userMessage}"
+                : userMessage;
 
         chatMessages.Add(new ChatMessage
         {
@@ -269,7 +366,8 @@ public partial class ChatService : IChatService
         {
             Type = "complete",
             MessageId = assistantMsg.Id,
-            CitedChunkIds = citedChunkIds
+            CitedChunkIds = citedChunkIds,
+            DegradedMode = searchFailed ? true : null
         };
     }
 

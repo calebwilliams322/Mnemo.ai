@@ -49,7 +49,7 @@ public interface IChatService
 public record ChatStreamResult
 {
     /// <summary>
-    /// Event type: "token", "complete", "error".
+    /// Event type: "token", "complete", "error", "warning".
     /// </summary>
     public required string Type { get; init; }
 
@@ -69,7 +69,13 @@ public record ChatStreamResult
     public List<Guid>? CitedChunkIds { get; init; }
 
     /// <summary>
-    /// Error message for "error" events.
+    /// Error message for "error" or "warning" events.
     /// </summary>
     public string? Error { get; init; }
+
+    /// <summary>
+    /// Indicates if the response was generated without RAG context due to search failure.
+    /// True when semantic search failed but chat continues with graceful degradation.
+    /// </summary>
+    public bool? DegradedMode { get; init; }
 }

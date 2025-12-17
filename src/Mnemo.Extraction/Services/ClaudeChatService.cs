@@ -1,10 +1,11 @@
 using System.Runtime.CompilerServices;
-using System.Text;
 using Anthropic.SDK;
 using Anthropic.SDK.Messaging;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mnemo.Extraction.Interfaces;
+using Mnemo.Extraction.Resilience;
+using Polly;
 
 namespace Mnemo.Extraction.Services;
 
@@ -16,11 +17,11 @@ public class ClaudeChatSettings
     public string ApiKey { get; set; } = string.Empty;
     public string Model { get; set; } = "claude-sonnet-4-20250514";
     public int MaxTokens { get; set; } = 2048;
-    public int MaxRetries { get; set; } = 3;
 }
 
 /// <summary>
 /// Service for conversational chat with Claude, supporting streaming responses.
+/// Uses Polly resilience pipeline for retry and circuit breaker.
 /// </summary>
 public class ClaudeChatService : IClaudeChatService
 {
@@ -28,14 +29,7 @@ public class ClaudeChatService : IClaudeChatService
     private readonly ILogger<ClaudeChatService> _logger;
     private readonly string _model;
     private readonly int _maxTokens;
-    private readonly int _maxRetries;
-
-    private static readonly TimeSpan[] RetryDelays =
-    [
-        TimeSpan.FromSeconds(1),
-        TimeSpan.FromSeconds(5),
-        TimeSpan.FromSeconds(15)
-    ];
+    private readonly ResiliencePipeline<ChatResponse> _resiliencePipeline;
 
     public ClaudeChatService(
         IOptions<ClaudeChatSettings> settings,
@@ -44,9 +38,10 @@ public class ClaudeChatService : IClaudeChatService
         _logger = logger;
         _model = settings.Value.Model;
         _maxTokens = settings.Value.MaxTokens;
-        _maxRetries = settings.Value.MaxRetries;
 
         _client = new AnthropicClient(settings.Value.ApiKey);
+        _resiliencePipeline = ResiliencePolicies.CreateExternalServicePipeline<ChatResponse>("Claude", _logger);
+
         _logger.LogInformation(
             "Claude Chat Service initialized with model: {Model}", _model);
     }
@@ -111,52 +106,28 @@ public class ClaudeChatService : IClaudeChatService
             "Sending chat request with {MessageCount} messages",
             request.Messages.Count);
 
-        Exception? lastException = null;
-
-        for (var attempt = 0; attempt < _maxRetries; attempt++)
+        return await _resiliencePipeline.ExecuteAsync(async token =>
         {
-            try
+            var parameters = BuildMessageParameters(request);
+            var response = await _client.Messages.GetClaudeMessageAsync(parameters, token);
+
+            var textContent = response.Content
+                .OfType<TextContent>()
+                .Select(c => c.Text)
+                .FirstOrDefault() ?? "";
+
+            _logger.LogInformation(
+                "Chat response received: {InputTokens} input, {OutputTokens} output tokens",
+                response.Usage?.InputTokens ?? 0,
+                response.Usage?.OutputTokens ?? 0);
+
+            return new ChatResponse
             {
-                var parameters = BuildMessageParameters(request);
-                var response = await _client.Messages.GetClaudeMessageAsync(parameters, ct);
-
-                var textContent = response.Content
-                    .OfType<TextContent>()
-                    .Select(c => c.Text)
-                    .FirstOrDefault() ?? "";
-
-                _logger.LogInformation(
-                    "Chat response received: {InputTokens} input, {OutputTokens} output tokens",
-                    response.Usage?.InputTokens ?? 0,
-                    response.Usage?.OutputTokens ?? 0);
-
-                return new ChatResponse
-                {
-                    Content = textContent,
-                    InputTokens = response.Usage?.InputTokens ?? 0,
-                    OutputTokens = response.Usage?.OutputTokens ?? 0
-                };
-            }
-            catch (Exception ex) when (IsRetryableError(ex))
-            {
-                lastException = ex;
-
-                if (attempt < _maxRetries - 1)
-                {
-                    var delay = RetryDelays[Math.Min(attempt, RetryDelays.Length - 1)];
-                    _logger.LogWarning(
-                        "Chat request failed (attempt {Attempt}/{Max}), retrying in {Delay}s: {Error}",
-                        attempt + 1, _maxRetries, delay.TotalSeconds, ex.Message);
-
-                    await Task.Delay(delay, ct);
-                }
-            }
-        }
-
-        _logger.LogError(lastException, "Chat request failed after {Max} attempts", _maxRetries);
-        throw new InvalidOperationException(
-            $"Failed to get Claude chat response after {_maxRetries} attempts",
-            lastException);
+                Content = textContent,
+                InputTokens = response.Usage?.InputTokens ?? 0,
+                OutputTokens = response.Usage?.OutputTokens ?? 0
+            };
+        }, ct);
     }
 
     private MessageParameters BuildMessageParameters(ChatRequest request)
@@ -176,27 +147,4 @@ public class ClaudeChatService : IClaudeChatService
         };
     }
 
-    private static bool IsRetryableError(Exception ex)
-    {
-        var message = ex.Message.ToLowerInvariant();
-
-        // Rate limit errors
-        if (message.Contains("rate limit") || message.Contains("429"))
-            return true;
-
-        // Server errors
-        if (message.Contains("500") || message.Contains("502") ||
-            message.Contains("503") || message.Contains("504"))
-            return true;
-
-        // Timeout errors
-        if (ex is TaskCanceledException or TimeoutException)
-            return true;
-
-        // Overloaded
-        if (message.Contains("overloaded"))
-            return true;
-
-        return false;
-    }
 }

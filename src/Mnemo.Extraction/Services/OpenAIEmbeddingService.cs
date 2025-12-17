@@ -1,8 +1,10 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mnemo.Extraction.Interfaces;
+using Mnemo.Extraction.Resilience;
 using OpenAI;
 using OpenAI.Embeddings;
+using Polly;
 
 namespace Mnemo.Extraction.Services;
 
@@ -24,20 +26,13 @@ public class OpenAIEmbeddingService : IEmbeddingService
     private readonly EmbeddingClient _client;
     private readonly ILogger<OpenAIEmbeddingService> _logger;
     private readonly string _model;
+    private readonly ResiliencePipeline<(List<float[]> embeddings, int tokens)> _resiliencePipeline;
 
     // text-embedding-3-small produces 1536 dimensions
     private const int SmallModelDimension = 1536;
 
     // Maximum texts per batch (OpenAI limit is ~2048, but we use smaller batches for reliability)
     private const int MaxBatchSize = 100;
-
-    // Retry configuration
-    private const int MaxRetries = 3;
-    private static readonly TimeSpan[] RetryDelays = [
-        TimeSpan.FromSeconds(1),
-        TimeSpan.FromSeconds(5),
-        TimeSpan.FromSeconds(15)
-    ];
 
     public OpenAIEmbeddingService(
         IOptions<OpenAISettings> settings,
@@ -48,6 +43,9 @@ public class OpenAIEmbeddingService : IEmbeddingService
 
         var client = new OpenAIClient(settings.Value.ApiKey);
         _client = client.GetEmbeddingClient(_model);
+
+        _resiliencePipeline = ResiliencePolicies.CreateExternalServicePipeline<(List<float[]>, int)>(
+            "OpenAI Embeddings", _logger);
 
         _logger.LogInformation("OpenAI Embedding Service initialized with model: {Model}", _model);
     }
@@ -121,70 +119,24 @@ public class OpenAIEmbeddingService : IEmbeddingService
     }
 
     /// <summary>
-    /// Process a batch of texts with retry logic for rate limits.
+    /// Process a batch of texts using Polly resilience pipeline.
     /// </summary>
     private async Task<(List<float[]> embeddings, int tokens)> ProcessBatchWithRetryAsync(
         List<string> texts)
     {
-        Exception? lastException = null;
-
-        for (var attempt = 0; attempt < MaxRetries; attempt++)
+        return await _resiliencePipeline.ExecuteAsync(async _ =>
         {
-            try
-            {
-                var response = await _client.GenerateEmbeddingsAsync(texts);
+            var response = await _client.GenerateEmbeddingsAsync(texts);
 
-                var embeddings = response.Value
-                    .OrderBy(e => e.Index)
-                    .Select(e => e.ToFloats().ToArray())
-                    .ToList();
+            var embeddings = response.Value
+                .OrderBy(e => e.Index)
+                .Select(e => e.ToFloats().ToArray())
+                .ToList();
 
-                // Estimate tokens from text length (API usage tracking may vary by SDK version)
-                var tokens = texts.Sum(t => (int)Math.Ceiling(t.Length / 4.0));
+            // Estimate tokens from text length (API usage tracking may vary by SDK version)
+            var tokens = texts.Sum(t => (int)Math.Ceiling(t.Length / 4.0));
 
-                return (embeddings, tokens);
-            }
-            catch (Exception ex) when (IsRetryableError(ex))
-            {
-                lastException = ex;
-
-                if (attempt < MaxRetries - 1)
-                {
-                    var delay = RetryDelays[attempt];
-                    _logger.LogWarning(
-                        "Embedding request failed (attempt {Attempt}/{Max}), retrying in {Delay}s: {Error}",
-                        attempt + 1, MaxRetries, delay.TotalSeconds, ex.Message);
-
-                    await Task.Delay(delay);
-                }
-            }
-        }
-
-        throw new InvalidOperationException(
-            $"Failed to generate embeddings after {MaxRetries} attempts",
-            lastException);
-    }
-
-    /// <summary>
-    /// Check if an error is retryable (rate limit, temporary server error).
-    /// </summary>
-    private static bool IsRetryableError(Exception ex)
-    {
-        var message = ex.Message.ToLowerInvariant();
-
-        // Rate limit errors
-        if (message.Contains("rate limit") || message.Contains("429"))
-            return true;
-
-        // Server errors
-        if (message.Contains("500") || message.Contains("502") ||
-            message.Contains("503") || message.Contains("504"))
-            return true;
-
-        // Timeout errors
-        if (ex is TaskCanceledException || ex is TimeoutException)
-            return true;
-
-        return false;
+            return (embeddings, tokens);
+        });
     }
 }

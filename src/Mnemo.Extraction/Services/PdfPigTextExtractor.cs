@@ -35,6 +35,8 @@ public class PdfPigTextExtractor : IPdfTextExtractor
             var pageTexts = new Dictionary<int, string>();
             var pageScores = new List<int>();
 
+            var scannedPageCount = 0;
+
             foreach (var page in document.GetPages())
             {
                 var pageText = ExtractPageText(page);
@@ -42,6 +44,16 @@ public class PdfPigTextExtractor : IPdfTextExtractor
 
                 var pageScore = CalculatePageQuality(pageText, page.Number);
                 pageScores.Add(pageScore);
+
+                // Detect full-page scanned images
+                var isScannedPage = IsFullPageImage(page, pageText);
+                if (isScannedPage)
+                {
+                    scannedPageCount++;
+                    _logger.LogDebug(
+                        "Page {PageNumber}: Detected as scanned image",
+                        page.Number);
+                }
 
                 _logger.LogDebug(
                     "Page {PageNumber}: {CharCount} chars, quality score: {Score}",
@@ -57,8 +69,17 @@ public class PdfPigTextExtractor : IPdfTextExtractor
                 Success = true,
                 PageCount = document.NumberOfPages,
                 PageTexts = pageTexts,
-                QualityScore = overallQuality
+                QualityScore = overallQuality,
+                ScannedPageCount = scannedPageCount
             };
+
+            if (result.IsHybridDocument)
+            {
+                _logger.LogWarning(
+                    "Hybrid PDF detected: {FileName} has {ScannedPages}/{TotalPages} scanned pages ({Percent}%). " +
+                    "Some content may require OCR for full extraction.",
+                    fileName, scannedPageCount, document.NumberOfPages, result.ScannedPagePercent);
+            }
 
             _logger.LogInformation(
                 "PDF extraction complete: {FileName}, {PageCount} pages, quality: {Quality}",
@@ -111,6 +132,42 @@ public class PdfPigTextExtractor : IPdfTextExtractor
 
             // Fallback: just get all text
             return page.Text ?? string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Detect if a page is primarily a full-page scanned image.
+    /// </summary>
+    private static bool IsFullPageImage(Page page, string extractedText)
+    {
+        // If we got substantial text, it's not a scanned page
+        if (extractedText.Length > 500)
+            return false;
+
+        try
+        {
+            var images = page.GetImages().ToList();
+            if (images.Count == 0)
+                return false;
+
+            // Check if any image covers most of the page (>80% of page area)
+            var pageArea = page.Width * page.Height;
+            foreach (var image in images)
+            {
+                var imageArea = image.Bounds.Width * image.Bounds.Height;
+                var coverageRatio = imageArea / pageArea;
+
+                // Full-page image with minimal text = scanned page
+                if (coverageRatio > 0.8 && extractedText.Length < 300)
+                    return true;
+            }
+
+            return false;
+        }
+        catch
+        {
+            // If we can't analyze images, assume not scanned
+            return false;
         }
     }
 

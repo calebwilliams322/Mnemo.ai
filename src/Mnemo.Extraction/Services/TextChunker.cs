@@ -101,63 +101,69 @@ public partial class TextChunker : ITextChunker
         var currentPageEnd = 0;
         var currentSectionType = (string?)null;
         var chunkIndex = 0;
-        var overlapText = "";
-        var overlapTokens = 0;
 
         foreach (var para in paragraphs)
         {
-            // Check if this paragraph would exceed max tokens
-            var wouldExceed = currentTokens + para.EstimatedTokens > options.MaxTokens;
+            // Handle oversized paragraphs by splitting them first
+            var partsToAdd = para.EstimatedTokens > options.MaxTokens
+                ? SplitLargeParagraph(para, options.MaxTokens)
+                : [para];
 
-            // Check if we should start a new chunk (target reached or section change)
-            var shouldSplit = wouldExceed ||
-                (currentTokens >= options.TargetTokens && IsGoodSplitPoint(para));
-
-            if (shouldSplit && currentText.Count > 0)
+            foreach (var part in partsToAdd)
             {
-                // Save current chunk
-                chunks.Add(CreateChunk(
-                    currentText,
-                    chunkIndex++,
-                    currentPageStart,
-                    currentPageEnd,
-                    currentTokens,
-                    currentSectionType));
+                // Check if this part would exceed max tokens
+                var wouldExceed = currentTokens + part.EstimatedTokens > options.MaxTokens;
 
-                // Calculate overlap from end of current chunk
-                (overlapText, overlapTokens) = GetOverlapText(currentText, options.OverlapTokens);
+                // Check if we should start a new chunk (target reached or section change)
+                var shouldSplit = wouldExceed ||
+                    (currentTokens >= options.TargetTokens && IsGoodSplitPoint(part));
 
-                // Start new chunk with overlap
-                currentText.Clear();
-                if (!string.IsNullOrEmpty(overlapText))
+                if (shouldSplit && currentText.Count > 0)
                 {
-                    currentText.Add(overlapText);
-                    currentTokens = overlapTokens;
+                    // Save current chunk
+                    chunks.Add(CreateChunk(
+                        currentText,
+                        chunkIndex++,
+                        currentPageStart,
+                        currentPageEnd,
+                        currentTokens,
+                        currentSectionType));
+
+                    // Calculate overlap from end of current chunk
+                    var (overlapText, overlapTokens) = GetOverlapText(currentText, options.OverlapTokens);
+
+                    // Start new chunk with overlap
+                    currentText.Clear();
+                    if (!string.IsNullOrEmpty(overlapText))
+                    {
+                        currentText.Add(overlapText);
+                        currentTokens = overlapTokens;
+                    }
+                    else
+                    {
+                        currentTokens = 0;
+                    }
+
+                    currentPageStart = part.PageNumber;
+                    currentSectionType = part.SectionType;
                 }
-                else
+
+                // Add part to current chunk
+                if (currentText.Count == 0)
                 {
-                    currentTokens = 0;
+                    currentPageStart = part.PageNumber;
+                    currentSectionType = part.SectionType;
                 }
 
-                currentPageStart = para.PageNumber;
-                currentSectionType = para.SectionType;
-            }
+                currentText.Add(part.Text);
+                currentTokens += part.EstimatedTokens;
+                currentPageEnd = part.PageNumber;
 
-            // Add paragraph to current chunk
-            if (currentText.Count == 0)
-            {
-                currentPageStart = para.PageNumber;
-                currentSectionType = para.SectionType;
-            }
-
-            currentText.Add(para.Text);
-            currentTokens += para.EstimatedTokens;
-            currentPageEnd = para.PageNumber;
-
-            // Update section type if we encounter a new section header
-            if (para.SectionType != null)
-            {
-                currentSectionType = para.SectionType;
+                // Update section type if we encounter a new section header
+                if (part.SectionType != null)
+                {
+                    currentSectionType = part.SectionType;
+                }
             }
         }
 
@@ -174,6 +180,128 @@ public partial class TextChunker : ITextChunker
         }
 
         return chunks;
+    }
+
+    /// <summary>
+    /// Split a large paragraph into smaller parts that respect the token limit.
+    /// Splits on sentence boundaries when possible.
+    /// </summary>
+    private List<ParagraphInfo> SplitLargeParagraph(ParagraphInfo para, int maxTokens)
+    {
+        var parts = new List<ParagraphInfo>();
+
+        // Try to split on sentence boundaries
+        var sentences = SplitIntoSentences(para.Text);
+
+        var currentText = new List<string>();
+        var currentTokenCount = 0;
+
+        foreach (var sentence in sentences)
+        {
+            var sentenceTokens = EstimateTokens(sentence);
+
+            // If a single sentence exceeds max, split it by words
+            if (sentenceTokens > maxTokens)
+            {
+                // Save current accumulated text first
+                if (currentText.Count > 0)
+                {
+                    parts.Add(new ParagraphInfo
+                    {
+                        Text = string.Join(" ", currentText),
+                        PageNumber = para.PageNumber,
+                        EstimatedTokens = currentTokenCount,
+                        SectionType = parts.Count == 0 ? para.SectionType : null
+                    });
+                    currentText.Clear();
+                    currentTokenCount = 0;
+                }
+
+                // Split the long sentence by words
+                var words = sentence.Split(' ');
+                var wordBatch = new List<string>();
+                var wordBatchTokens = 0;
+
+                foreach (var word in words)
+                {
+                    var wordTokens = EstimateTokens(word + " ");
+                    if (wordBatchTokens + wordTokens > maxTokens && wordBatch.Count > 0)
+                    {
+                        parts.Add(new ParagraphInfo
+                        {
+                            Text = string.Join(" ", wordBatch),
+                            PageNumber = para.PageNumber,
+                            EstimatedTokens = wordBatchTokens,
+                            SectionType = null
+                        });
+                        wordBatch.Clear();
+                        wordBatchTokens = 0;
+                    }
+                    wordBatch.Add(word);
+                    wordBatchTokens += wordTokens;
+                }
+
+                if (wordBatch.Count > 0)
+                {
+                    currentText.AddRange(wordBatch);
+                    currentTokenCount += wordBatchTokens;
+                }
+            }
+            else if (currentTokenCount + sentenceTokens > maxTokens)
+            {
+                // Save current and start new
+                if (currentText.Count > 0)
+                {
+                    parts.Add(new ParagraphInfo
+                    {
+                        Text = string.Join(" ", currentText),
+                        PageNumber = para.PageNumber,
+                        EstimatedTokens = currentTokenCount,
+                        SectionType = parts.Count == 0 ? para.SectionType : null
+                    });
+                }
+                currentText.Clear();
+                currentText.Add(sentence);
+                currentTokenCount = sentenceTokens;
+            }
+            else
+            {
+                currentText.Add(sentence);
+                currentTokenCount += sentenceTokens;
+            }
+        }
+
+        // Don't forget the last part
+        if (currentText.Count > 0)
+        {
+            parts.Add(new ParagraphInfo
+            {
+                Text = string.Join(" ", currentText),
+                PageNumber = para.PageNumber,
+                EstimatedTokens = currentTokenCount,
+                SectionType = parts.Count == 0 ? para.SectionType : null
+            });
+        }
+
+        _logger.LogDebug(
+            "Split large paragraph ({OriginalTokens} tokens) into {Parts} parts",
+            para.EstimatedTokens, parts.Count);
+
+        return parts;
+    }
+
+    /// <summary>
+    /// Split text into sentences using common sentence-ending punctuation.
+    /// </summary>
+    private static List<string> SplitIntoSentences(string text)
+    {
+        // Split on sentence boundaries (., !, ?) followed by space or end of string
+        var sentences = Regex.Split(text, @"(?<=[.!?])\s+")
+            .Select(s => s.Trim())
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToList();
+
+        return sentences.Count > 0 ? sentences : [text];
     }
 
     /// <summary>

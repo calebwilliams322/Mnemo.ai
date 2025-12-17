@@ -40,6 +40,22 @@ public class PdfExtractionResult
     /// Whether the document appears to be scanned (low quality text).
     /// </summary>
     public bool AppearsScanned => QualityScore < 30;
+
+    /// <summary>
+    /// Number of pages that contain full-page images (likely scanned).
+    /// </summary>
+    public int ScannedPageCount { get; init; }
+
+    /// <summary>
+    /// Whether the document is a hybrid (mix of native text and scanned pages).
+    /// These documents have partial extraction and may benefit from OCR.
+    /// </summary>
+    public bool IsHybridDocument => ScannedPageCount > 0 && ScannedPageCount < PageCount;
+
+    /// <summary>
+    /// Percentage of pages that are scanned images (0-100).
+    /// </summary>
+    public int ScannedPagePercent => PageCount > 0 ? (ScannedPageCount * 100) / PageCount : 0;
 }
 
 /// <summary>

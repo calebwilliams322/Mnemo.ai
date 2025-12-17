@@ -414,6 +414,23 @@ All production auth security features implemented:
 | Parallelism | **2 concurrent jobs** | Balance speed vs resource usage |
 | Duplicate Detection | **Deferred** | Not in Phase 3 scope |
 
+### ⚠️ Cross-Phase Dependencies (READ THIS FIRST)
+
+Phase 3 is **infrastructure** that later phases plug into. Design with extensibility in mind:
+
+| Dependency | Phase | What Phase 3 Must Provide |
+|------------|-------|---------------------------|
+| **Extraction Pipeline** | 5-8 | Storage service to read uploaded files; Job queue to run extraction jobs; Status updates during processing |
+| **Webhooks** | 4 | **Event-based job completion** - Don't hardcode notifications. Emit events (e.g., `DocumentProcessed`) that Phase 4 can subscribe to for firing webhooks |
+| **Chat/RAG** | 9 | Documents stored with consistent paths; DocumentChunks created during extraction (Phase 6) |
+| **Frontend** | 13-14 | SignalR hub for real-time updates; Presigned URLs for downloads |
+
+**Key Design Decisions:**
+1. **Use domain events pattern** - When a job completes, publish a `DocumentProcessedEvent` rather than directly calling notification code. Phase 4 webhooks and Phase 3 SignalR both subscribe to this event.
+2. **Storage paths must be deterministic** - `{tenant_id}/{document_id}/{filename}` so extraction pipeline can find files
+3. **Job queue interface must support typed jobs** - Phase 5-8 will create `ExtractTextJob`, `ClassifyDocumentJob`, etc.
+4. **SignalR hub should be generic** - Not just for documents; will be reused for chat, compliance checks, etc.
+
 ### 3.1 Storage Service (Supabase Storage)
 - [ ] Verify/create RLS policies on "documents" bucket
 - [ ] Create `IStorageService` interface
@@ -479,19 +496,46 @@ POST /documents
 
 ### 3.4 Real-time Status Updates (SignalR)
 - [ ] Add SignalR NuGet package: `Microsoft.AspNetCore.SignalR`
-- [ ] Create `DocumentHub` for WebSocket connections
+- [ ] Create `NotificationHub` (generic, not document-specific) for WebSocket connections
 - [ ] Authenticate WebSocket connections with JWT
-- [ ] Implement status broadcast methods:
-  - `DocumentStatusChanged(documentId, status, progress)`
-  - `DocumentProcessingComplete(documentId, success, error?)`
-  - `BatchStatusChanged(batchId, completedCount, totalCount)`
-- [ ] Client joins room based on tenant ID (isolation)
+- [ ] Implement broadcast methods:
+  - `SendToTenantAsync(tenantId, eventType, payload)` - generic event broadcast
+  - `SendToUserAsync(userId, eventType, payload)` - user-specific notifications
+- [ ] Client joins group based on tenant ID (isolation)
+- [ ] Define event types enum: `DocumentStatusChanged`, `DocumentProcessed`, `ExtractionProgress`, etc.
 
 **🧪 Test checkpoint 3.4:**
 - [ ] Client connects via WebSocket with JWT
-- [ ] Status updates broadcast to connected clients
-- [ ] Tenant isolation (Tenant A doesn't see Tenant B updates)
+- [ ] Events broadcast to correct tenant group
+- [ ] Tenant isolation (Tenant A doesn't see Tenant B events)
 - [ ] Reconnection works after disconnect
+
+### 3.5 Domain Events Infrastructure
+- [ ] Create `IDomainEvent` interface in `Mnemo.Domain`
+- [ ] Create `IEventPublisher` interface in `Mnemo.Application`
+- [ ] Implement `InMemoryEventPublisher` (synchronous for now, can swap to message queue later)
+- [ ] Create domain events:
+  - `DocumentUploadedEvent(documentId, tenantId)`
+  - `DocumentProcessingStartedEvent(documentId, tenantId)`
+  - `DocumentProcessedEvent(documentId, tenantId, success, error?)`
+- [ ] Create `IEventHandler<TEvent>` interface for subscribers
+- [ ] Wire up SignalR as an event handler (subscribes to events → broadcasts to clients)
+- [ ] **Phase 4 will add webhook handler** that subscribes to same events
+
+**Why this matters:**
+```
+Job Completes → Publish DocumentProcessedEvent
+                        │
+                        ├─► SignalREventHandler → Broadcasts to WebSocket clients (Phase 3)
+                        │
+                        └─► WebhookEventHandler → Fires HTTP webhooks (Phase 4 adds this)
+```
+
+**🧪 Test checkpoint 3.5:**
+- [ ] Event published when document uploaded
+- [ ] Event published when processing completes
+- [ ] SignalR handler receives events and broadcasts
+- [ ] Multiple handlers can subscribe to same event
 
 ---
 

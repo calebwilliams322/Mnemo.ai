@@ -21,6 +21,8 @@ using Mnemo.Infrastructure.Services;
 using Mnemo.Api.EventHandlers;
 using Mnemo.Domain.Events;
 using Mnemo.Infrastructure.EventHandlers;
+using Mnemo.Extraction.Interfaces;
+using Mnemo.Extraction.Services;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -63,6 +65,14 @@ builder.Services.AddScoped<IAuditService, AuditService>();
 
 // Register Storage service (Supabase Storage)
 builder.Services.AddScoped<IStorageService, SupabaseStorageService>();
+
+// Configure OpenAI settings for embeddings
+builder.Services.Configure<OpenAISettings>(builder.Configuration.GetSection("OpenAI"));
+
+// Register Extraction services (PDF extraction, chunking, embeddings)
+builder.Services.AddScoped<IPdfTextExtractor, PdfPigTextExtractor>();
+builder.Services.AddScoped<ITextChunker, TextChunker>();
+builder.Services.AddScoped<IEmbeddingService, OpenAIEmbeddingService>();
 
 // Register Event Publisher and Background Job Service
 builder.Services.AddScoped<IEventPublisher, EventPublisher>();

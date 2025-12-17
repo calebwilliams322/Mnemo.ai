@@ -580,82 +580,134 @@ Job Completes → Publish DocumentProcessedEvent
 
 ---
 
-## Phase 5: PDF Text Extraction
-**Duration estimate: Core extraction - Stage 1**
+## Phase 5 & 6: PDF Extraction & Chunking (Combined)
+**Duration estimate: Core extraction pipeline**
 
-### 5.1 Native PDF Text Extraction
-- [ ] Create `IPdfTextExtractor` interface
-- [ ] Implement using PdfPig
-- [ ] Extract text with page numbers
-- [ ] Preserve basic layout
+### Pre-Resolved Decisions for Phase 5 & 6
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| OCR Support | **None for MVP** | Most insurance docs are digital PDFs. Scanned PDFs fail with clear error. Can add OCR later if needed. |
+| Job Structure | **Single job** | Extract → Chunk → Embed in one job. Simpler, fewer moving parts. Code structured as separate functions internally for future splitting if needed. |
+| Intermediate Storage | **None** | Raw text lives in memory during job, then saved directly as DocumentChunks. No separate ExtractedText field needed. |
+| Embedding Model | **OpenAI text-embedding-3-small** | Good balance of cost/quality for RAG |
+
+### Architecture: Single Stateless Job
+
+```
+Document Upload
+      │
+      ▼
+┌─────────────────────────────────────────────────────┐
+│              Hangfire Background Job                 │
+│                                                     │
+│  1. Download PDF from Supabase Storage              │
+│  2. Extract text with PdfPig                        │
+│  3. Check quality (detect scanned PDFs)             │
+│  4. If scanned → FAIL with clear error message      │
+│  5. Chunk text (section-aware, ~500-1000 tokens)    │
+│  6. Generate embeddings (OpenAI batch)              │
+│  7. Save DocumentChunks to database                 │
+│  8. Update Document status → completed              │
+│  9. Publish DocumentProcessedEvent                  │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+      │
+      ▼
+SignalR broadcast + Webhook delivery (via event handlers)
+```
+
+**Why single job for MVP:**
+- Simpler to reason about and debug
+- No intermediate storage complexity
+- Can always split later if chunking strategy changes frequently
+- Jobs are still stateless and idempotent
+
+### 5.1 PDF Text Extraction Service
+- [ ] Create `IPdfTextExtractor` interface in Mnemo.Extraction
+- [ ] Implement `PdfPigTextExtractor`:
+  - Extract text page by page
+  - Preserve page numbers
+  - Handle multi-column layouts (best effort)
+- [ ] Create quality scoring function:
+  - Check for minimum text length per page
+  - Detect garbage characters (high ratio of special chars)
+  - Return quality score 0-100
+- [ ] If quality < threshold → fail with error: "Document appears to be scanned. Please upload a digital PDF."
 
 **🧪 Test checkpoint 5.1:**
-- [ ] Extract text from native PDF
+- [ ] Extract text from sample policies in `/samples/` directory
 - [ ] Page numbers correct
-- [ ] Handle multi-column layouts
+- [ ] Quality detection identifies good vs bad PDFs
+- [ ] Clear error message for scanned/image PDFs
 
-### 5.2 Text Quality Detection
-- [ ] Create quality scoring function
-- [ ] Detect scanned/image PDFs
-- [ ] Detect garbage characters
+### 5.2 Text Chunking Service
+- [ ] Create `ITextChunker` interface
+- [ ] Implement `TextChunker`:
+  - Split by section headers where possible
+  - Respect token limits (target 500-1000 tokens)
+  - Add overlap between chunks (~50 tokens)
+  - Tag chunks with page number metadata
+- [ ] Handle endorsements as individual chunks
 
 **🧪 Test checkpoint 5.2:**
-- [ ] Good PDF scores high
-- [ ] Scanned PDF scores low
-- [ ] Triggers OCR fallback correctly
+- [ ] Chunks within token limits
+- [ ] Page numbers preserved in metadata
+- [ ] Overlap between sequential chunks
+- [ ] Large documents chunk correctly
 
-### 5.3 OCR Fallback (Azure Document Intelligence)
-- [ ] Create `IOcrService` interface
-- [ ] Implement Azure DI client
-- [ ] Handle async processing
-- [ ] Merge results with page numbers
+### 5.3 Embedding Service
+- [ ] Create `IEmbeddingService` interface
+- [ ] Implement `OpenAIEmbeddingService`:
+  - Batch embedding requests (up to 100 texts per call)
+  - Handle rate limits with retry
+  - Return vectors for storage
+- [ ] Store embeddings in DocumentChunk.Embedding (pgvector)
 
 **🧪 Test checkpoint 5.3:**
-- [ ] Scanned PDF extracts correctly
-- [ ] Page numbers preserved
-- [ ] Error handling for API failures
+- [ ] Embeddings generated correctly (1536 dimensions)
+- [ ] Batch processing works
+- [ ] Stored in database with pgvector
+- [ ] Basic similarity search returns relevant chunks
 
-**⚠️ DECISION GATE 5.3:** OCR cost acceptable? Need Tesseract fallback?
+### 5.4 Integrate with Document Processing Job
+- [ ] Update `DocumentProcessingService.ProcessDocumentAsync()` to:
+  1. Download PDF from storage
+  2. Call text extractor
+  3. Check quality, fail if scanned
+  4. Call chunker
+  5. Call embedding service
+  6. Save DocumentChunks
+  7. Update Document (status, page_count)
+  8. Publish DocumentProcessedEvent
+- [ ] Proper error handling at each stage
+- [ ] Transaction for chunk inserts
+
+**🧪 Test checkpoint 5.4:**
+- [ ] Upload document → job runs → chunks created
+- [ ] Document status updates correctly
+- [ ] Webhook fires on completion
+- [ ] SignalR broadcasts status
+- [ ] Failed documents have clear error messages
+
+### 5.5 Document Classification (Simple)
+- [ ] Create `IDocumentClassifier` interface
+- [ ] Implement simple classification (can enhance with LLM in Phase 7):
+  - Detect document type from filename/content keywords
+  - Types: policy, quote, binder, endorsement, dec_page, certificate, contract
+- [ ] Store in Document.DocumentType
+
+**🧪 Test checkpoint 5.5:**
+- [ ] Classifies sample policies correctly
+- [ ] Unknown types default to "policy"
+
+**⚠️ DECISION GATE 5:** Test with all sample policies. Extraction + chunking working? Ready for structured extraction?
 
 ---
 
-## Phase 6: Document Classification & Chunking
-**Duration estimate: Core extraction - Stages 2 & 3**
-
-### 6.1 Document Classification
-- [ ] Create classification prompt (from EXTRACTION_STRATEGY.md)
-- [ ] Create `IDocumentClassifier` interface
-- [ ] Implement Claude-based classification
-- [ ] Return document type, sections, coverages detected
-
-**🧪 Test checkpoint 6.1:**
-- [ ] Classifies GL policy correctly
-- [ ] Identifies sections with page ranges
-- [ ] Detects multiple coverage types in package
-
-### 6.2 Smart Chunking
-- [ ] Create `IDocumentChunker` interface
-- [ ] Implement section-aware chunking
-- [ ] Respect token limits (500-1000 tokens)
-- [ ] Add overlap between chunks
-- [ ] Tag chunks with metadata
-
-**🧪 Test checkpoint 6.2:**
-- [ ] Chunks respect section boundaries
-- [ ] Token counts within limits
-- [ ] Metadata correctly applied
-- [ ] Endorsements chunked individually
-
-### 6.3 Embedding Generation
-- [ ] Create `IEmbeddingService` interface
-- [ ] Implement OpenAI embeddings client
-- [ ] Batch processing for efficiency
-- [ ] Store in pgvector
-
-**🧪 Test checkpoint 6.3:**
-- [ ] Embeddings generated correctly
-- [ ] Stored in database
-- [ ] Similarity search returns relevant chunks
+## Phase 6: MERGED INTO PHASE 5
+> Phase 6 (chunking + embeddings) has been combined with Phase 5 into a single extraction job.
+> See "Phase 5 & 6: PDF Extraction & Chunking (Combined)" above.
 
 ---
 

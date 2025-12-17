@@ -40,6 +40,14 @@ builder.Services.Configure<SupabaseSettings>(
 // Register CurrentUser service
 builder.Services.AddScoped<ICurrentUserService, CurrentUserService>();
 
+// Configure named HttpClient for Supabase with proper headers and connection pooling
+builder.Services.AddHttpClient("Supabase", client =>
+{
+    client.BaseAddress = new Uri(supabaseSettings.Url);
+    client.DefaultRequestHeaders.Add("apikey", supabaseSettings.ServiceRoleKey);
+    client.DefaultRequestHeaders.Add("Authorization", $"Bearer {supabaseSettings.ServiceRoleKey}");
+});
+
 // Register Supabase Auth service
 builder.Services.AddScoped<ISupabaseAuthService, SupabaseAuthService>();
 
@@ -60,7 +68,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateIssuerSigningKey = true,
             IssuerSigningKey = new SymmetricSecurityKey(
                 Encoding.UTF8.GetBytes(supabaseSettings.JwtSecret)),
-            ClockSkew = TimeSpan.Zero
+            ClockSkew = TimeSpan.FromSeconds(30) // Allow 30s clock drift tolerance
         };
 
         options.Events = new JwtBearerEvents
@@ -96,9 +104,10 @@ builder.Services.AddRateLimiter(options =>
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
     // Strict limit for signup - 5 requests per IP per hour
+    // Uses X-Forwarded-For to get real client IP behind proxies/load balancers
     options.AddPolicy("signup", context =>
         RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            partitionKey: GetClientIp(context),
             factory: _ => new FixedWindowRateLimiterOptions
             {
                 PermitLimit = 5,
@@ -110,7 +119,7 @@ builder.Services.AddRateLimiter(options =>
     // Moderate limit for invites - 20 per user per hour
     options.AddPolicy("invite", context =>
         RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: context.User.Identity?.Name ?? context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            partitionKey: context.User.Identity?.Name ?? GetClientIp(context),
             factory: _ => new FixedWindowRateLimiterOptions
             {
                 PermitLimit = 20,
@@ -122,7 +131,7 @@ builder.Services.AddRateLimiter(options =>
     // General API limit - 100 requests per user per minute
     options.AddPolicy("api", context =>
         RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: context.User.Identity?.Name ?? context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            partitionKey: context.User.Identity?.Name ?? GetClientIp(context),
             factory: _ => new FixedWindowRateLimiterOptions
             {
                 PermitLimit = 100,
@@ -166,7 +175,7 @@ app.MapPost("/auth/signup", async (
     var userAgent = httpContext.Request.Headers.UserAgent.ToString();
 
     // Validate input
-    if (string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
+    if (!IsValidEmail(request.Email))
     {
         await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
             details: new { email = request.Email, reason = "invalid_email" });
@@ -202,10 +211,13 @@ app.MapPost("/auth/signup", async (
     // Start a transaction
     await using var transaction = await db.Database.BeginTransactionAsync();
 
+    // Declare outside try block so we can clean up in catch block if needed
+    SupabaseUserResult? supabaseResult = null;
+
     try
     {
         // 1. Create user in Supabase Auth
-        var supabaseResult = await supabaseAuth.CreateUserAsync(request.Email, request.Password);
+        supabaseResult = await supabaseAuth.CreateUserAsync(request.Email, request.Password);
 
         if (!supabaseResult.Success)
         {
@@ -266,6 +278,33 @@ app.MapPost("/auth/signup", async (
     {
         await transaction.RollbackAsync();
 
+        // COMPENSATION: Delete orphaned Supabase user if DB transaction failed
+        if (supabaseResult?.Success == true && !string.IsNullOrEmpty(supabaseResult.SupabaseUserId))
+        {
+            try
+            {
+                var deleted = await supabaseAuth.DeleteUserAsync(supabaseResult.SupabaseUserId);
+                if (deleted)
+                {
+                    logger.LogWarning(
+                        "Cleaned up orphaned Supabase user {SupabaseUserId} after DB failure",
+                        supabaseResult.SupabaseUserId);
+                }
+                else
+                {
+                    logger.LogError(
+                        "Failed to clean up orphaned Supabase user {SupabaseUserId} - manual cleanup required",
+                        supabaseResult.SupabaseUserId);
+                }
+            }
+            catch (Exception cleanupEx)
+            {
+                logger.LogError(cleanupEx,
+                    "Exception cleaning up orphaned Supabase user {SupabaseUserId} - manual cleanup required",
+                    supabaseResult.SupabaseUserId);
+            }
+        }
+
         logger.LogError(ex, "Failed to create tenant for {Email}", request.Email);
         await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
             details: new { email = request.Email, reason = "exception", error = ex.Message });
@@ -290,7 +329,7 @@ app.MapPost("/auth/password-reset", async (
     var userAgent = httpContext.Request.Headers.UserAgent.ToString();
 
     // Validate email format
-    if (string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
+    if (!IsValidEmail(request.Email))
     {
         await auditService.LogEventAsync("password_reset", "failure", ipAddress: ipAddress, userAgent: userAgent,
             details: new { email = request.Email, reason = "invalid_email" });
@@ -429,12 +468,22 @@ app.MapPost("/tenant/users/invite", async (
         return Results.Unauthorized();
 
     // Validate email
-    if (string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
+    if (!IsValidEmail(request.Email))
     {
         await auditService.LogEventAsync("invite", "failure",
             tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
             details: new { email = request.Email, reason = "invalid_email" });
         return Results.BadRequest("Valid email is required");
+    }
+
+    // Validate role
+    string[] allowedRoles = [UserRole.User, UserRole.Admin];
+    if (!allowedRoles.Contains(request.Role, StringComparer.OrdinalIgnoreCase))
+    {
+        await auditService.LogEventAsync("invite", "failure",
+            tenantId: currentUser.TenantId, userId: currentUser.UserId, ipAddress: ipAddress, userAgent: userAgent,
+            details: new { email = request.Email, reason = "invalid_role", role = request.Role });
+        return Results.BadRequest($"Invalid role. Allowed: {string.Join(", ", allowedRoles)}");
     }
 
     // Check if user already exists in this tenant
@@ -599,4 +648,40 @@ app.MapPatch("/tenant/users/{userId:guid}/reactivate", async (
 app.Run();
 
 // Make Program accessible for integration tests
-public partial class Program { }
+public partial class Program
+{
+    /// <summary>
+    /// Validates email format using System.Net.Mail.MailAddress.
+    /// More robust than simple Contains('@') check.
+    /// </summary>
+    internal static bool IsValidEmail(string? email)
+    {
+        if (string.IsNullOrWhiteSpace(email)) return false;
+        try
+        {
+            var addr = new System.Net.Mail.MailAddress(email);
+            return addr.Address == email;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Gets the client IP address, checking X-Forwarded-For header for proxy/load balancer scenarios.
+    /// </summary>
+    internal static string GetClientIp(HttpContext context)
+    {
+        // Check X-Forwarded-For (first IP in chain is original client)
+        var forwardedFor = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(forwardedFor))
+        {
+            var ip = forwardedFor.Split(',').First().Trim();
+            // Basic validation - should be a valid IP
+            if (System.Net.IPAddress.TryParse(ip, out _))
+                return ip;
+        }
+        return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    }
+}

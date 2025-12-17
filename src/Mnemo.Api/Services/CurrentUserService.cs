@@ -125,6 +125,23 @@ public class CurrentUserService : ICurrentUserService
         _initialized = true;
     }
 
+    /// <summary>
+    /// Looks up user details from database using Supabase user ID.
+    /// </summary>
+    /// <remarks>
+    /// TRADE-OFF: This method performs a synchronous database call because C# properties
+    /// cannot be async. This is called once per request when user properties are accessed.
+    ///
+    /// For high-traffic scenarios, consider:
+    /// 1. Adding an index on supabase_user_id (done - see MnemoDbContext)
+    /// 2. Implementing a short-lived cache (30s TTL) to reduce DB load
+    /// 3. Using async middleware to pre-populate user context before handlers
+    ///
+    /// Current mitigations:
+    /// - Uses AsNoTracking() to reduce memory overhead
+    /// - Query is simple (single-column lookup with index)
+    /// - Results are cached for duration of request (_initialized flag)
+    /// </remarks>
     private void LookupUserFromDatabase(string supabaseUserId)
     {
         // Resolve DbContext lazily to avoid circular DI dependency
@@ -135,18 +152,28 @@ public class CurrentUserService : ICurrentUserService
         // IMPORTANT: Use IgnoreQueryFilters to avoid circular dependency
         // The query filter depends on CurrentUserService.TenantId, which would call this method
         var user = dbContext.Users
+            .Include(u => u.Tenant)
             .IgnoreQueryFilters()
             .AsNoTracking()
             .FirstOrDefault(u => u.SupabaseUserId == supabaseUserId);
 
         if (user != null)
         {
+            var logger = scope.ServiceProvider.GetRequiredService<ILogger<CurrentUserService>>();
+
+            // SECURITY: Users from deactivated tenants cannot access the system
+            if (user.Tenant?.IsActive == false)
+            {
+                logger.LogWarning(
+                    "User from deactivated tenant attempted access: UserId={UserId}, TenantId={TenantId}",
+                    user.Id, user.TenantId);
+                return; // Leave all fields null - effectively unauthorized
+            }
+
             // SECURITY: Deactivated users cannot access the system
             // They have valid Supabase tokens but we reject them at the application level
             if (!user.IsActive)
             {
-                // Log this attempt - user is trying to use a deactivated account
-                var logger = scope.ServiceProvider.GetRequiredService<ILogger<CurrentUserService>>();
                 logger.LogWarning(
                     "Deactivated user attempted access: UserId={UserId}, Email={Email}",
                     user.Id, user.Email);

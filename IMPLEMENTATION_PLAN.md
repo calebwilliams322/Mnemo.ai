@@ -401,43 +401,97 @@ All production auth security features implemented:
 ## Phase 3: Document Upload & Storage
 **Duration estimate: File handling foundation**
 
-### 3.1 Storage Service
+### Pre-Resolved Decisions for Phase 3
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Storage | **Supabase Storage** | Already configured, same auth, simpler setup |
+| Job Queue | **Hangfire + PostgreSQL** | Jobs persist across restarts, no in-memory |
+| Hangfire Dashboard | **Not exposed** | Security - no admin UI in production |
+| Real-time Updates | **SignalR WebSocket** | Instant notifications, navigate-away safe |
+| Document Types | **PDF only** (for now) | Core use case, can extend later |
+| Batch Size | **Up to 5 documents** | Reasonable for large 100+ page docs |
+| Parallelism | **2 concurrent jobs** | Balance speed vs resource usage |
+| Duplicate Detection | **Deferred** | Not in Phase 3 scope |
+
+### 3.1 Storage Service (Supabase Storage)
+- [ ] Verify/create RLS policies on "documents" bucket
 - [ ] Create `IStorageService` interface
-- [ ] Implement `R2StorageService` using S3 SDK
-- [ ] Methods: `UploadAsync`, `DownloadAsync`, `GetPresignedUrlAsync`, `DeleteAsync`
-- [ ] Configure for local development (can use MinIO as alternative)
+- [ ] Implement `SupabaseStorageService`:
+  - `UploadAsync(tenantId, fileName, stream)` → returns storage path
+  - `DownloadAsync(storagePath)` → returns stream
+  - `GetSignedUrlAsync(storagePath, expiry)` → returns presigned URL
+  - `DeleteAsync(storagePath)`
+- [ ] Tenant isolation via folder structure: `{tenant_id}/{document_id}/{filename}`
 
 **🧪 Test checkpoint 3.1:**
-- [ ] Unit tests with mocked S3 client
-- [ ] Integration test: upload real PDF, download, verify identical
+- [ ] Unit tests with mocked Supabase client
+- [ ] Integration test: upload PDF, download, verify identical
+- [ ] Tenant A cannot access Tenant B files
 
 ### 3.2 Document Upload Endpoints
-- [ ] `POST /documents` - single file upload
-- [ ] `POST /documents/batch` - multi-file upload
-- [ ] `GET /documents` - list with filters
-- [ ] `GET /documents/{id}` - get details
-- [ ] `GET /documents/{id}/download` - download original
-- [ ] `DELETE /documents/{id}`
+- [ ] `POST /documents` - single file upload (PDF only, returns 202 Accepted)
+- [ ] `POST /documents/batch` - multi-file upload (max 5 files)
+- [ ] `GET /documents` - list with filters (status, date range)
+- [ ] `GET /documents/{id}` - get details including processing status
+- [ ] `GET /documents/{id}/download` - get presigned download URL
+- [ ] `DELETE /documents/{id}` - soft delete (marks as deleted)
+
+**Upload Flow:**
+```
+POST /documents
+    │
+    ├─► Validate (PDF only, size limits)
+    ├─► Save to Supabase Storage
+    ├─► Create Document record (status: "uploaded")
+    ├─► Queue extraction job via Hangfire
+    └─► Return 202 Accepted with document ID
+```
 
 **🧪 Test checkpoint 3.2:**
-- [ ] Upload 1MB PDF succeeds
-- [ ] Upload 50MB PDF succeeds (chunked)
+- [ ] Upload PDF succeeds, returns 202
 - [ ] Upload non-PDF rejected with 400
+- [ ] Batch upload (5 files) works
+- [ ] Batch upload >5 files rejected
 - [ ] List/filter works correctly
-- [ ] Download returns correct file
+- [ ] Download returns presigned URL
+- [ ] Delete marks document as deleted
 
 ### 3.3 Background Job Infrastructure (Hangfire)
-- [ ] Add Hangfire NuGet packages
-- [ ] Configure Hangfire with PostgreSQL storage
-- [ ] Set up Hangfire dashboard (dev only)
-- [ ] Create `IJobQueue` interface wrapping Hangfire
-- [ ] Implement job scheduling for extraction
+- [ ] Add Hangfire NuGet packages:
+  - `Hangfire.Core`
+  - `Hangfire.AspNetCore`
+  - `Hangfire.PostgreSql`
+- [ ] Configure Hangfire with PostgreSQL storage (NOT in-memory)
+- [ ] **Do NOT expose Hangfire dashboard**
+- [ ] Create `IBackgroundJobService` interface:
+  - `EnqueueAsync<T>(Expression<Func<T, Task>>)` - immediate execution
+  - `ScheduleAsync<T>(Expression<Func<T, Task>>, TimeSpan delay)` - delayed
+- [ ] Configure job queue with **2 worker threads** for parallel processing
+- [ ] Implement retry policy: 3 attempts with exponential backoff
 
 **🧪 Test checkpoint 3.3:**
 - [ ] Job enqueues successfully
-- [ ] Job executes in background
-- [ ] Job status trackable via Hangfire dashboard
-- [ ] Job retries on failure
+- [ ] Job executes in background (user can navigate away)
+- [ ] Job persists across server restart
+- [ ] Job retries on failure (3 attempts)
+- [ ] 2 jobs process in parallel
+
+### 3.4 Real-time Status Updates (SignalR)
+- [ ] Add SignalR NuGet package: `Microsoft.AspNetCore.SignalR`
+- [ ] Create `DocumentHub` for WebSocket connections
+- [ ] Authenticate WebSocket connections with JWT
+- [ ] Implement status broadcast methods:
+  - `DocumentStatusChanged(documentId, status, progress)`
+  - `DocumentProcessingComplete(documentId, success, error?)`
+  - `BatchStatusChanged(batchId, completedCount, totalCount)`
+- [ ] Client joins room based on tenant ID (isolation)
+
+**🧪 Test checkpoint 3.4:**
+- [ ] Client connects via WebSocket with JWT
+- [ ] Status updates broadcast to connected clients
+- [ ] Tenant isolation (Tenant A doesn't see Tenant B updates)
+- [ ] Reconnection works after disconnect
 
 ---
 

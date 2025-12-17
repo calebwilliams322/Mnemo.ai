@@ -125,6 +125,7 @@ public class MnemoDbContext : DbContext
 
             entity.HasIndex(e => e.Email).IsUnique();
             entity.HasIndex(e => e.TenantId);
+            entity.HasIndex(e => e.SupabaseUserId);
 
             entity.HasOne(e => e.Tenant)
                 .WithMany(t => t.Users)

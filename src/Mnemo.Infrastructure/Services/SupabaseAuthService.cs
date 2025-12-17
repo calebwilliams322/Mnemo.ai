@@ -1,8 +1,6 @@
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using Mnemo.Application.Configuration;
 using Mnemo.Application.Services;
 
 namespace Mnemo.Infrastructure.Services;
@@ -14,22 +12,14 @@ namespace Mnemo.Infrastructure.Services;
 public class SupabaseAuthService : ISupabaseAuthService
 {
     private readonly HttpClient _httpClient;
-    private readonly SupabaseSettings _settings;
     private readonly ILogger<SupabaseAuthService> _logger;
 
     public SupabaseAuthService(
-        IOptions<SupabaseSettings> settings,
-        ILogger<SupabaseAuthService> logger,
-        IHttpClientFactory? httpClientFactory = null)
+        IHttpClientFactory httpClientFactory,
+        ILogger<SupabaseAuthService> logger)
     {
-        _settings = settings.Value;
+        _httpClient = httpClientFactory.CreateClient("Supabase");
         _logger = logger;
-
-        // Create HTTP client for Supabase Admin API
-        _httpClient = httpClientFactory?.CreateClient("Supabase") ?? new HttpClient();
-        _httpClient.BaseAddress = new Uri(_settings.Url);
-        _httpClient.DefaultRequestHeaders.Add("apikey", _settings.ServiceRoleKey);
-        _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_settings.ServiceRoleKey}");
     }
 
     public async Task<SupabaseUserResult> CreateUserAsync(string email, string password)

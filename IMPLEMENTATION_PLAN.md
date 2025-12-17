@@ -712,51 +712,482 @@ SignalR broadcast + Webhook delivery (via event handlers)
 ---
 
 ## Phase 7: Structured Data Extraction
-**Duration estimate: Core extraction - Stage 5**
+**Duration estimate: Core AI extraction logic**
 
-### 7.1 Core Policy Extraction (Pass 1)
-- [ ] Create extraction prompt for declarations
-- [ ] Create `IPolicyExtractor` interface
-- [ ] Extract: policy number, dates, carrier, insured, premium
-- [ ] Parse and validate extracted data
+> **This is the core intelligence of the product.** Phase 7 builds the extraction services.
+> Phase 8 integrates them into the pipeline orchestrator.
+
+### Reference: Extraction Pipeline Stages
+```
+Stage 1: Text Extraction (PdfPig)           ✅ Done in Phase 5
+Stage 2: Document Classification            ← Phase 7.1
+Stage 3: Smart Chunking                     ✅ Done in Phase 5
+Stage 4: Embedding Generation               ✅ Done in Phase 5
+Stage 5: Structured Extraction (Two-Pass)   ← Phase 7.2, 7.3
+Stage 6: Validation & Confidence            ← Phase 7.4
+```
+
+### Key Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| LLM for extraction | Claude (claude-sonnet-4) | Already configured, good at structured extraction |
+| Input to Claude | Relevant chunks by section_type | Chunks already tagged with section_type during Phase 5 |
+| Document vs Coverage | Document type ≠ Coverage type | A BOP document contains GL + Property coverages |
+| Storage | Structured columns + JSONB details | Queryable fields + flexible coverage-specific data |
+| Prompts | 12 prompts for 24 coverage types | Tiered approach - dedicated for complex, shared for similar |
+
+---
+
+### 7.1 Document Classification Service
+
+Before extracting, identify what we're looking at and what coverages are present.
+
+- [ ] Create `IDocumentClassifier` interface in `Mnemo.Extraction`
+- [ ] Implement `ClaudeDocumentClassifier`:
+  - Input: First 5-10 pages of document text (or relevant chunks)
+  - Output: `DocumentClassificationResult`
+- [ ] Create classification prompt (see EXTRACTION_STRATEGY.md for template)
+
+**DocumentClassificationResult:**
+```csharp
+public record DocumentClassificationResult
+{
+    public required string DocumentType { get; init; }  // policy, quote, binder, endorsement, dec_page, certificate, contract
+    public required List<SectionInfo> Sections { get; init; }
+    public required List<string> CoveragesDetected { get; init; }  // ["general_liability", "commercial_property", ...]
+    public decimal Confidence { get; init; }
+}
+
+public record SectionInfo
+{
+    public required string SectionType { get; init; }  // declarations, coverage_form, endorsements, schedule, conditions
+    public int StartPage { get; init; }
+    public int EndPage { get; init; }
+    public List<string>? FormNumbers { get; init; }  // ["CG0001", "CG2010"]
+}
+```
+
+**Classification determines:**
+1. What `document_type` to store on Document entity
+2. Which coverage extractors to run (Pass 2)
+3. Which chunks to send to each extractor (by section_type)
 
 **🧪 Test checkpoint 7.1:**
-- [ ] Extracts core fields correctly
-- [ ] Handles missing fields gracefully
-- [ ] Confidence scoring works
+- [ ] Classifies GL policy correctly
+- [ ] Classifies BOP as having GL + Property coverages
+- [ ] Identifies section page ranges
+- [ ] Detects multiple coverages in package policies
+- [ ] Returns confidence score
 
-### 7.2 Coverage Extraction (Pass 2)
-- [ ] Create prompts for each coverage type:
-  - [ ] General Liability
-  - [ ] Commercial Property
-  - [ ] Business Auto
-  - [ ] Workers Comp
-  - [ ] Umbrella/Excess
-  - [ ] Professional Liability
-  - [ ] Cyber
-  - [ ] Wind/Flood/Earthquake
-- [ ] Extract limits, deductibles, endorsements, exclusions
-- [ ] Store in Coverage entity with JSONB details
+---
+
+### 7.2 Core Policy Extraction (Pass 1)
+
+Extract core policy info from declarations section only (minimize tokens).
+
+- [ ] Create `IPolicyExtractor` interface
+- [ ] Implement `ClaudePolicyExtractor`:
+  - Input: Chunks where `section_type = "declarations"`
+  - Output: `PolicyExtractionResult`
+- [ ] Create extraction prompt for declarations
+
+**PolicyExtractionResult → Maps to Policy entity:**
+```csharp
+public record PolicyExtractionResult
+{
+    // Identification
+    public string? PolicyNumber { get; init; }
+    public string? QuoteNumber { get; init; }
+
+    // Dates
+    public DateOnly? EffectiveDate { get; init; }
+    public DateOnly? ExpirationDate { get; init; }
+    public DateOnly? QuoteExpirationDate { get; init; }
+
+    // Carrier
+    public string? CarrierName { get; init; }
+    public string? CarrierNaic { get; init; }
+
+    // Insured
+    public string? InsuredName { get; init; }
+    public string? InsuredAddressLine1 { get; init; }
+    public string? InsuredAddressLine2 { get; init; }
+    public string? InsuredCity { get; init; }
+    public string? InsuredState { get; init; }
+    public string? InsuredZip { get; init; }
+
+    // Financials
+    public decimal? TotalPremium { get; init; }
+
+    // Status detection
+    public string PolicyStatus { get; init; } = "quote";  // quote, bound, active
+
+    // Raw output for debugging
+    public string? RawExtraction { get; init; }
+    public decimal Confidence { get; init; }
+}
+```
 
 **🧪 Test checkpoint 7.2:**
-- [ ] GL extraction accurate
-- [ ] Property with multiple locations works
-- [ ] Endorsements parsed correctly
-- [ ] Exclusions captured
-- [ ] JSONB details queryable
+- [ ] Extracts policy number, dates correctly
+- [ ] Parses carrier name and NAIC
+- [ ] Extracts full insured address
+- [ ] Handles missing fields gracefully (nulls, not errors)
+- [ ] Detects policy status from language
 
-### 7.3 Validation & Confidence
-- [ ] Implement validation rules
-- [ ] Calculate confidence scores
-- [ ] Flag low-confidence extractions
-- [ ] Store extraction results
+---
+
+### 7.3 Coverage Extraction (Pass 2)
+
+Run once per coverage detected. Use chunks tagged for that coverage type.
+
+#### 7.3.1 Coverage Extractor Architecture
+
+- [ ] Create `ICoverageExtractor` interface
+- [ ] Create base `CoverageExtractionResult` with common fields
+- [ ] Create coverage-specific result types that extend base
+- [ ] Implement `ClaudeCoverageExtractor` with prompt selection logic
+
+**Base CoverageExtractionResult → Maps to Coverage entity columns:**
+```csharp
+public record CoverageExtractionResult
+{
+    public required string CoverageType { get; init; }
+    public string? CoverageSubtype { get; init; }
+
+    // Common queryable fields (stored in columns)
+    public decimal? EachOccurrenceLimit { get; init; }
+    public decimal? AggregateLimit { get; init; }
+    public decimal? Deductible { get; init; }
+    public decimal? Premium { get; init; }
+    public bool? IsOccurrenceForm { get; init; }
+    public bool? IsClaimsMade { get; init; }
+    public DateOnly? RetroactiveDate { get; init; }
+
+    // Coverage-specific details (stored in JSONB)
+    public required Dictionary<string, object> Details { get; init; }
+
+    public decimal Confidence { get; init; }
+}
+```
+
+#### 7.3.2 Coverage Prompt Tiers
+
+**TIER 1: Core Commercial - Dedicated Prompts (5 prompts)**
+
+| Coverage Type | Key Fields in Details JSONB |
+|--------------|----------------------------|
+| `general_liability` | products_completed_ops_aggregate, personal_advertising_injury, fire_damage_limit, medical_expense_limit, aggregate_applies_to (policy/project/location), key_endorsements (AI, WOS, PNC, blanket_AI), endorsements[], exclusions[] |
+| `commercial_property` | locations[] (address, building_limit, contents_limit, BI_limit, deductible), blanket_limits, valuation (RC/ACV/agreed), coinsurance, covered_perils (basic/broad/special), equipment_breakdown, ordinance_or_law |
+| `business_auto` | vehicles[] (year, make, VIN, symbol), liability_limit, um_uim_limit, medical_payments, comprehensive_deductible, collision_deductible, hired_auto, non_owned_auto |
+| `workers_compensation` | statutory_limits, employers_liability_each_accident, employers_liability_disease_each, employers_liability_disease_policy, experience_mod, class_codes[], waiver_of_subrogation, other_states |
+| `umbrella_excess` | umbrella_limit, self_insured_retention, is_following_form, underlying_requirements[], retained_limits, defense_coverage |
+
+- [ ] Create `GeneralLiabilityExtractor` with dedicated prompt
+- [ ] Create `CommercialPropertyExtractor` with dedicated prompt
+- [ ] Create `BusinessAutoExtractor` with dedicated prompt
+- [ ] Create `WorkersCompExtractor` with dedicated prompt
+- [ ] Create `UmbrellaExcessExtractor` with dedicated prompt
+
+**TIER 2: Claims-Made Liability - Shared Prompt (covers 5 types)**
+
+Covers: `professional_liability`, `directors_officers`, `employment_practices`, `cyber_liability`, `medical_malpractice`
+
+| Common Fields | Details JSONB |
+|--------------|---------------|
+| All use is_claims_made=true | defense_inside_limits, extended_reporting_period_days, prior_acts_date, coverage_trigger, sublimits{}, exclusions[] |
+
+- [ ] Create `ClaimsMadeLiabilityExtractor` with shared prompt
+- [ ] Prompt takes coverage_type parameter to customize field names
+
+**TIER 3: Property Extensions - Shared Prompt (covers 4 types)**
+
+Covers: `wind_hail`, `flood`, `earthquake`, `difference_in_conditions`
+
+| Common Fields | Details JSONB |
+|--------------|---------------|
+| Deductible can be % or flat | deductible_type (flat/percentage), deductible_percentage, deductible_minimum, deductible_maximum, waiting_period_hours, covered_perils[], excluded_perils[], sublimit |
+
+- [ ] Create `PropertyExtensionExtractor` with shared prompt
+- [ ] Prompt takes coverage_type parameter
+
+**TIER 4: Marine & Equipment - Shared Prompt (covers 4 types)**
+
+Covers: `inland_marine`, `ocean_marine`, `builders_risk`, `boiler_machinery`
+
+| Common Fields | Details JSONB |
+|--------------|---------------|
+| Property-like limits | covered_property_types[], valuation, territory, transit_coverage, installation_coverage |
+
+- [ ] Create `MarineEquipmentExtractor` with shared prompt
+
+**TIER 5: Specialized Liability - Individual Prompts (4 prompts)**
+
+| Coverage | Why Dedicated | Key Details |
+|----------|--------------|-------------|
+| `pollution_liability` | Unique triggers | cleanup_costs_limit, first_party_coverage, third_party_coverage, mold_coverage, asbestos_exclusion, transportation_coverage |
+| `garage_liability` | Auto dealer specific | garagekeepers_limit, dealers_coverage, false_pretense, customer_auto_coverage |
+| `liquor_liability` | Liquor-specific | assault_battery_coverage, host_liquor_vs_vendor, liquor_license_required |
+| `product_liability` | When separate from GL | products_aggregate, completed_ops_aggregate, recall_coverage, vendor_coverage |
+
+- [ ] Create `PollutionLiabilityExtractor`
+- [ ] Create `GarageLiabilityExtractor`
+- [ ] Create `LiquorLiabilityExtractor`
+- [ ] Create `ProductLiabilityExtractor`
+
+**TIER 6: Other Specialized - Individual Prompts (3 prompts)**
+
+| Coverage | Structure | Key Details |
+|----------|-----------|-------------|
+| `crime_fidelity` | Multiple insuring agreements | employee_theft_limit, forgery_limit, computer_fraud_limit, funds_transfer_fraud, social_engineering_limit, client_coverage |
+| `surety_bond` | Completely different | bond_type, principal, obligee, penal_sum, bond_term, conditions |
+| `aviation` | Specialized | hull_coverage, liability_limit, medical_payments, territory, pilot_warranty, use_limitations |
+
+- [ ] Create `CrimeFidelityExtractor`
+- [ ] Create `SuretyBondExtractor`
+- [ ] Create `AviationExtractor`
+
+**Total: 12 extractor implementations covering 24 coverage types**
+
+#### 7.3.3 Extractor Factory
+
+- [ ] Create `CoverageExtractorFactory` that returns correct extractor for coverage type
+- [ ] Map coverage types to extractors:
+```csharp
+public ICoverageExtractor GetExtractor(string coverageType) => coverageType switch
+{
+    CoverageType.GeneralLiability => _glExtractor,
+    CoverageType.CommercialProperty => _propertyExtractor,
+    CoverageType.BusinessAuto => _autoExtractor,
+    CoverageType.WorkersCompensation => _wcExtractor,
+    CoverageType.UmbrellaExcess => _umbrellaExtractor,
+
+    // Claims-made group
+    CoverageType.ProfessionalLiability or
+    CoverageType.DirectorsOfficers or
+    CoverageType.EmploymentPractices or
+    CoverageType.CyberLiability or
+    CoverageType.MedicalMalpractice => _claimsMadeExtractor,
+
+    // Property extensions group
+    CoverageType.WindHail or
+    CoverageType.Flood or
+    CoverageType.Earthquake or
+    CoverageType.DifferenceInConditions => _propertyExtensionExtractor,
+
+    // Marine/equipment group
+    CoverageType.InlandMarine or
+    CoverageType.OceanMarine or
+    CoverageType.BuildersRisk or
+    CoverageType.BoilerMachinery => _marineExtractor,
+
+    // Individual specialized
+    CoverageType.PollutionLiability => _pollutionExtractor,
+    CoverageType.GarageLiability => _garageExtractor,
+    CoverageType.LiquorLiability => _liquorExtractor,
+    CoverageType.ProductLiability => _productExtractor,
+    CoverageType.CrimeFidelity => _crimeExtractor,
+    CoverageType.SuretyBond => _suretyExtractor,
+    CoverageType.Aviation => _aviationExtractor,
+
+    // BOP extracts as GL + Property (handled at classification level)
+    _ => _genericExtractor
+};
+```
 
 **🧪 Test checkpoint 7.3:**
-- [ ] Invalid dates caught
-- [ ] Confidence reflects accuracy
-- [ ] Low-confidence items flagged
+- [ ] GL extraction captures all 6 limit types
+- [ ] GL key endorsements (AI, WOS, PNC) detected correctly
+- [ ] Property extraction handles multiple locations
+- [ ] Auto extraction parses vehicle schedules
+- [ ] WC extraction captures experience mod and class codes
+- [ ] Umbrella extraction identifies underlying requirements
+- [ ] Claims-made coverages extract retro date and ERP
+- [ ] BOP document creates separate GL and Property coverage records
+- [ ] All coverage types store correct JSONB details
 
-**⚠️ DECISION GATE 7.3:** Review extraction accuracy with real policies. Acceptable?
+---
+
+### 7.4 Validation & Confidence Scoring
+
+- [ ] Create `IExtractionValidator` interface
+- [ ] Implement validation rules per entity type
+- [ ] Calculate confidence scores
+- [ ] Flag extractions needing human review
+
+**Validation Rules:**
+```csharp
+public record ValidationResult
+{
+    public bool IsValid { get; init; }
+    public List<ValidationError> Errors { get; init; } = [];
+    public List<ValidationWarning> Warnings { get; init; } = [];
+    public decimal AdjustedConfidence { get; init; }
+}
+
+// Policy validation
+- Expiration date must be after effective date
+- If policy_number exists, should match expected format
+- Carrier name should not be empty for bound policies
+- Insured name required
+
+// Coverage validation
+- Each occurrence limit should not exceed aggregate (for GL)
+- Limits should be positive numbers
+- Deductible should not exceed limits
+- Claims-made coverage must have retroactive date if is_claims_made=true
+```
+
+**Confidence Scoring:**
+```
+Overall confidence = weighted average of:
+  - Document classification confidence (10%)
+  - Core policy extraction confidence (30%)
+  - Coverage extraction confidences (60%)
+
+Flag for human review if:
+  - Overall confidence < 0.7
+  - Any required field missing
+  - Validation errors present
+```
+
+- [ ] Store `extraction_confidence` on Policy and Coverage entities
+- [ ] Create `ProcessingStatus.NeedsReview` for low-confidence extractions
+
+**🧪 Test checkpoint 7.4:**
+- [ ] Invalid dates caught and flagged
+- [ ] Limit sanity checks work
+- [ ] Confidence score reflects extraction quality
+- [ ] Low-confidence extractions flagged for review
+- [ ] Validation errors stored and retrievable
+
+---
+
+### 7.5 Claude Service Integration
+
+- [ ] Create `IClaudeExtractionService` in `Mnemo.Extraction`
+- [ ] Implement with Anthropic SDK (already in project)
+- [ ] Handle rate limits with retry logic
+- [ ] Support structured JSON output mode
+- [ ] Track token usage for cost monitoring
+
+```csharp
+public interface IClaudeExtractionService
+{
+    Task<T> ExtractAsync<T>(string prompt, string context, CancellationToken ct = default);
+    Task<string> ClassifyDocumentAsync(string documentText, CancellationToken ct = default);
+}
+```
+
+**🧪 Test checkpoint 7.5:**
+- [ ] Claude calls work with structured output
+- [ ] Rate limit retry works
+- [ ] Token usage tracked
+- [ ] Errors handled gracefully
+
+---
+
+### 7.6 Services to Create (Summary)
+
+| Service | Interface | Implementation |
+|---------|-----------|----------------|
+| Document Classifier | `IDocumentClassifier` | `ClaudeDocumentClassifier` |
+| Policy Extractor | `IPolicyExtractor` | `ClaudePolicyExtractor` |
+| Coverage Extractor | `ICoverageExtractor` | Multiple implementations |
+| Extractor Factory | `ICoverageExtractorFactory` | `CoverageExtractorFactory` |
+| Extraction Validator | `IExtractionValidator` | `ExtractionValidator` |
+| Claude Service | `IClaudeExtractionService` | `ClaudeExtractionService` |
+
+**File Structure:**
+```
+src/Mnemo.Extraction/
+├── Interfaces/
+│   ├── IDocumentClassifier.cs
+│   ├── IPolicyExtractor.cs
+│   ├── ICoverageExtractor.cs
+│   ├── ICoverageExtractorFactory.cs
+│   ├── IExtractionValidator.cs
+│   └── IClaudeExtractionService.cs
+├── Services/
+│   ├── ClaudeDocumentClassifier.cs
+│   ├── ClaudePolicyExtractor.cs
+│   ├── ClaudeExtractionService.cs
+│   ├── CoverageExtractorFactory.cs
+│   ├── ExtractionValidator.cs
+│   └── Extractors/
+│       ├── GeneralLiabilityExtractor.cs
+│       ├── CommercialPropertyExtractor.cs
+│       ├── BusinessAutoExtractor.cs
+│       ├── WorkersCompExtractor.cs
+│       ├── UmbrellaExcessExtractor.cs
+│       ├── ClaimsMadeLiabilityExtractor.cs
+│       ├── PropertyExtensionExtractor.cs
+│       ├── MarineEquipmentExtractor.cs
+│       ├── PollutionLiabilityExtractor.cs
+│       ├── GarageLiabilityExtractor.cs
+│       ├── LiquorLiabilityExtractor.cs
+│       ├── ProductLiabilityExtractor.cs
+│       ├── CrimeFidelityExtractor.cs
+│       ├── SuretyBondExtractor.cs
+│       └── AviationExtractor.cs
+├── Models/
+│   ├── DocumentClassificationResult.cs
+│   ├── PolicyExtractionResult.cs
+│   ├── CoverageExtractionResult.cs
+│   └── ValidationResult.cs
+└── Prompts/
+    ├── ClassificationPrompt.cs
+    ├── PolicyExtractionPrompt.cs
+    └── CoveragePrompts/
+        ├── GeneralLiabilityPrompt.cs
+        ├── CommercialPropertyPrompt.cs
+        └── ... (one per extractor)
+```
+
+---
+
+### 7.7 Integration Points for Phase 8
+
+Phase 8 will create `ExtractionPipeline` that orchestrates:
+
+```
+DocumentProcessingService (existing, from Phase 5)
+    │
+    ├── Downloads PDF from storage
+    ├── Extracts text with PdfPigTextExtractor
+    ├── Checks quality (rejects scanned PDFs)
+    ├── Chunks text with TextChunker
+    ├── Generates embeddings with OpenAIEmbeddingService
+    ├── Saves DocumentChunks to database
+    │
+    ▼
+ExtractionPipeline (Phase 8 - NEW)
+    │
+    ├── Calls IDocumentClassifier → saves Document.DocumentType
+    ├── Calls IPolicyExtractor → creates Policy record
+    ├── For each coverage detected:
+    │   └── Calls ICoverageExtractor → creates Coverage record
+    ├── Calls IExtractionValidator → flags issues
+    ├── Updates Document.ProcessingStatus
+    └── Publishes DocumentProcessedEvent
+```
+
+**What Phase 7 provides to Phase 8:**
+- All extraction services (classifier, extractors, validator)
+- Result types that map to entities
+- Confidence scores for quality tracking
+
+**What Phase 8 adds:**
+- Orchestration logic (call services in order)
+- Transaction handling (all-or-nothing for Policy + Coverages)
+- Error recovery (partial extraction handling)
+- Status updates and event publishing
+- Policy/Coverage endpoints for API access
+
+---
+
+**⚠️ DECISION GATE 7:** Test extraction accuracy with all sample policies before Phase 8 integration. Each coverage type should extract correctly.
 
 ---
 

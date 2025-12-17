@@ -8,4 +8,5 @@ public class SupabaseSettings
     public string AnonKey { get; set; } = string.Empty;
     public string ServiceRoleKey { get; set; } = string.Empty;
     public string JwtSecret { get; set; } = string.Empty;
+    public string BucketName { get; set; } = "documents";
 }

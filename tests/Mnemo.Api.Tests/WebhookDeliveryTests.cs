@@ -15,7 +15,8 @@ namespace Mnemo.Api.Tests;
 /// <summary>
 /// Tests that verify webhooks actually fire when events occur.
 /// </summary>
-public class WebhookDeliveryTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
+[Collection("Integration")]
+public class WebhookDeliveryTests : IAsyncLifetime
 {
     private readonly CustomWebApplicationFactory _factory;
     private Tenant? _testTenant;
@@ -251,7 +252,8 @@ public class WebhookDeliveryTests : IClassFixture<CustomWebApplicationFactory>, 
 /// <summary>
 /// Tests that verify the event publisher dispatches to both SignalR and Webhook handlers.
 /// </summary>
-public class EventPublisherTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
+[Collection("Integration")]
+public class EventPublisherTests : IAsyncLifetime
 {
     private readonly CustomWebApplicationFactory _factory;
     private Tenant? _testTenant;

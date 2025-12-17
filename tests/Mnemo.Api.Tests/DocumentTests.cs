@@ -13,7 +13,8 @@ namespace Mnemo.Api.Tests;
 /// <summary>
 /// Integration tests for document upload endpoints.
 /// </summary>
-public class DocumentTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
+[Collection("Integration")]
+public class DocumentTests : IAsyncLifetime
 {
     private readonly CustomWebApplicationFactory _factory;
     private Tenant? _testTenant;

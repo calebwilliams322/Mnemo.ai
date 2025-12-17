@@ -97,4 +97,37 @@ public class NotificationHub : Hub
             "Client {ConnectionId} left document group {DocumentGroup}",
             Context.ConnectionId, documentGroup);
     }
+
+    /// <summary>
+    /// Allows clients to join a specific conversation's notification group.
+    /// Use this when a user is in a chat conversation and wants real-time updates.
+    /// </summary>
+    public async Task JoinConversationGroup(Guid conversationId)
+    {
+        if (!_currentUser.TenantId.HasValue)
+        {
+            _logger.LogWarning("Unauthorized attempt to join conversation group");
+            return;
+        }
+
+        var conversationGroup = $"conversation_{conversationId}";
+        await Groups.AddToGroupAsync(Context.ConnectionId, conversationGroup);
+
+        _logger.LogDebug(
+            "Client {ConnectionId} joined conversation group {ConversationGroup}",
+            Context.ConnectionId, conversationGroup);
+    }
+
+    /// <summary>
+    /// Allows clients to leave a specific conversation's notification group.
+    /// </summary>
+    public async Task LeaveConversationGroup(Guid conversationId)
+    {
+        var conversationGroup = $"conversation_{conversationId}";
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, conversationGroup);
+
+        _logger.LogDebug(
+            "Client {ConnectionId} left conversation group {ConversationGroup}",
+            Context.ConnectionId, conversationGroup);
+    }
 }

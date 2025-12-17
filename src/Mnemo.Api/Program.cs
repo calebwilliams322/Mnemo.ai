@@ -26,6 +26,7 @@ using Mnemo.Extraction.Interfaces;
 using Mnemo.Extraction.Services;
 using Mnemo.Extraction.DependencyInjection;
 using System.Text.Json;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -38,11 +39,17 @@ var supabaseSettings = builder.Configuration
 builder.Services.AddOpenApi();
 builder.Services.AddHttpContextAccessor();
 
-// Register DbContext
+// Register DbContext with pgvector support
+// NpgsqlDataSourceBuilder is required for Npgsql 8+ to properly handle Vector type parameters in queries
+// UseVector() must be called on BOTH the data source builder AND the EF Core options
+var connectionString = builder.Configuration.GetValue<string>("Database:ConnectionString")
+    ?? throw new InvalidOperationException("Database connection string is required");
+var dataSourceBuilder = new NpgsqlDataSourceBuilder(connectionString);
+dataSourceBuilder.UseVector();
+var dataSource = dataSourceBuilder.Build();
+
 builder.Services.AddDbContext<MnemoDbContext>(options =>
-    options.UseNpgsql(
-        builder.Configuration.GetValue<string>("Database:ConnectionString"),
-        o => o.UseVector()));
+    options.UseNpgsql(dataSource, npgsqlOptions => npgsqlOptions.UseVector()));
 
 // Register Supabase settings
 builder.Services.Configure<SupabaseSettings>(
@@ -103,7 +110,6 @@ builder.Services.AddScoped<IBackgroundJobService, HangfireJobService>();
 builder.Services.AddScoped<IDocumentProcessingService, DocumentProcessingService>();
 
 // Configure Hangfire with PostgreSQL storage (NOT in-memory)
-var connectionString = builder.Configuration.GetValue<string>("Database:ConnectionString");
 builder.Services.AddHangfire(config => config
     .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
     .UseSimpleAssemblyNameTypeSerializer()

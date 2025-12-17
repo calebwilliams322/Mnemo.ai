@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Mnemo.Domain\Mnemo.Domain.csproj" />
     <ProjectReference Include="..\Mnemo.Application\Mnemo.Application.csproj" />
+    <ProjectReference Include="..\Mnemo.Extraction\Mnemo.Extraction.csproj" />
   </ItemGroup>
 
   <ItemGroup>

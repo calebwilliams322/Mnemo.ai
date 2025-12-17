@@ -1,0 +1,190 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Mnemo.Extraction.Interfaces;
+using OpenAI;
+using OpenAI.Embeddings;
+
+namespace Mnemo.Extraction.Services;
+
+/// <summary>
+/// Configuration for OpenAI embedding service.
+/// </summary>
+public class OpenAISettings
+{
+    public string ApiKey { get; set; } = string.Empty;
+    public string EmbeddingModel { get; set; } = "text-embedding-3-small";
+}
+
+/// <summary>
+/// Generates text embeddings using OpenAI's embedding models.
+/// Supports batch processing with automatic retry on rate limits.
+/// </summary>
+public class OpenAIEmbeddingService : IEmbeddingService
+{
+    private readonly EmbeddingClient _client;
+    private readonly ILogger<OpenAIEmbeddingService> _logger;
+    private readonly string _model;
+
+    // text-embedding-3-small produces 1536 dimensions
+    private const int SmallModelDimension = 1536;
+
+    // Maximum texts per batch (OpenAI limit is ~2048, but we use smaller batches for reliability)
+    private const int MaxBatchSize = 100;
+
+    // Retry configuration
+    private const int MaxRetries = 3;
+    private static readonly TimeSpan[] RetryDelays = [
+        TimeSpan.FromSeconds(1),
+        TimeSpan.FromSeconds(5),
+        TimeSpan.FromSeconds(15)
+    ];
+
+    public OpenAIEmbeddingService(
+        IOptions<OpenAISettings> settings,
+        ILogger<OpenAIEmbeddingService> logger)
+    {
+        _logger = logger;
+        _model = settings.Value.EmbeddingModel;
+
+        var client = new OpenAIClient(settings.Value.ApiKey);
+        _client = client.GetEmbeddingClient(_model);
+
+        _logger.LogInformation("OpenAI Embedding Service initialized with model: {Model}", _model);
+    }
+
+    public int EmbeddingDimension => SmallModelDimension;
+
+    public async Task<EmbeddingResult> GenerateEmbeddingAsync(string text)
+    {
+        var result = await GenerateEmbeddingsAsync([text]);
+        return result;
+    }
+
+    public async Task<EmbeddingResult> GenerateEmbeddingsAsync(IReadOnlyList<string> texts)
+    {
+        if (texts.Count == 0)
+        {
+            return new EmbeddingResult
+            {
+                Success = true,
+                Embeddings = [],
+                TotalTokensUsed = 0
+            };
+        }
+
+        _logger.LogInformation("Generating embeddings for {Count} texts", texts.Count);
+
+        try
+        {
+            var allEmbeddings = new List<float[]>();
+            var totalTokens = 0;
+
+            // Process in batches
+            for (var i = 0; i < texts.Count; i += MaxBatchSize)
+            {
+                var batch = texts.Skip(i).Take(MaxBatchSize).ToList();
+                var (embeddings, tokens) = await ProcessBatchWithRetryAsync(batch);
+
+                allEmbeddings.AddRange(embeddings);
+                totalTokens += tokens;
+
+                _logger.LogDebug(
+                    "Processed batch {BatchNum}/{TotalBatches}: {Count} embeddings",
+                    (i / MaxBatchSize) + 1,
+                    (texts.Count + MaxBatchSize - 1) / MaxBatchSize,
+                    batch.Count);
+            }
+
+            _logger.LogInformation(
+                "Embedding generation complete: {Count} embeddings, {Tokens} tokens used",
+                allEmbeddings.Count, totalTokens);
+
+            return new EmbeddingResult
+            {
+                Success = true,
+                Embeddings = allEmbeddings,
+                TotalTokensUsed = totalTokens
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Embedding generation failed");
+
+            return new EmbeddingResult
+            {
+                Success = false,
+                Error = $"Failed to generate embeddings: {ex.Message}",
+                Embeddings = [],
+                TotalTokensUsed = 0
+            };
+        }
+    }
+
+    /// <summary>
+    /// Process a batch of texts with retry logic for rate limits.
+    /// </summary>
+    private async Task<(List<float[]> embeddings, int tokens)> ProcessBatchWithRetryAsync(
+        List<string> texts)
+    {
+        Exception? lastException = null;
+
+        for (var attempt = 0; attempt < MaxRetries; attempt++)
+        {
+            try
+            {
+                var response = await _client.GenerateEmbeddingsAsync(texts);
+
+                var embeddings = response.Value
+                    .OrderBy(e => e.Index)
+                    .Select(e => e.ToFloats().ToArray())
+                    .ToList();
+
+                // Estimate tokens from text length (API usage tracking may vary by SDK version)
+                var tokens = texts.Sum(t => (int)Math.Ceiling(t.Length / 4.0));
+
+                return (embeddings, tokens);
+            }
+            catch (Exception ex) when (IsRetryableError(ex))
+            {
+                lastException = ex;
+
+                if (attempt < MaxRetries - 1)
+                {
+                    var delay = RetryDelays[attempt];
+                    _logger.LogWarning(
+                        "Embedding request failed (attempt {Attempt}/{Max}), retrying in {Delay}s: {Error}",
+                        attempt + 1, MaxRetries, delay.TotalSeconds, ex.Message);
+
+                    await Task.Delay(delay);
+                }
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Failed to generate embeddings after {MaxRetries} attempts",
+            lastException);
+    }
+
+    /// <summary>
+    /// Check if an error is retryable (rate limit, temporary server error).
+    /// </summary>
+    private static bool IsRetryableError(Exception ex)
+    {
+        var message = ex.Message.ToLowerInvariant();
+
+        // Rate limit errors
+        if (message.Contains("rate limit") || message.Contains("429"))
+            return true;
+
+        // Server errors
+        if (message.Contains("500") || message.Contains("502") ||
+            message.Contains("503") || message.Contains("504"))
+            return true;
+
+        // Timeout errors
+        if (ex is TaskCanceledException || ex is TimeoutException)
+            return true;
+
+        return false;
+    }
+}

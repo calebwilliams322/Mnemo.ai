@@ -21,8 +21,10 @@ using Mnemo.Infrastructure.Services;
 using Mnemo.Api.EventHandlers;
 using Mnemo.Domain.Events;
 using Mnemo.Infrastructure.EventHandlers;
+using Microsoft.AspNetCore.Mvc;
 using Mnemo.Extraction.Interfaces;
 using Mnemo.Extraction.Services;
+using Mnemo.Extraction.DependencyInjection;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -69,10 +71,14 @@ builder.Services.AddScoped<IStorageService, SupabaseStorageService>();
 // Configure OpenAI settings for embeddings
 builder.Services.Configure<OpenAISettings>(builder.Configuration.GetSection("OpenAI"));
 
-// Register Extraction services (PDF extraction, chunking, embeddings)
-builder.Services.AddScoped<IPdfTextExtractor, PdfPigTextExtractor>();
-builder.Services.AddScoped<ITextChunker, TextChunker>();
-builder.Services.AddScoped<IEmbeddingService, OpenAIEmbeddingService>();
+// Configure Claude settings for extraction
+builder.Services.Configure<ClaudeExtractionSettings>(builder.Configuration.GetSection("Claude"));
+
+// Register all extraction services (PDF, Claude, embeddings)
+builder.Services.AddExtractionServices();
+
+// Register ExtractionPipeline (orchestrates Phase 7 services)
+builder.Services.AddScoped<IExtractionPipeline, ExtractionPipeline>();
 
 // Register Event Publisher and Background Job Service
 builder.Services.AddScoped<IEventPublisher, EventPublisher>();
@@ -1340,6 +1346,313 @@ app.MapGet("/webhooks/{id:guid}/deliveries", async (
 .WithTags("Webhooks")
 .RequireRateLimiting("api");
 
+// ============================================================================
+// Policy Endpoints
+// ============================================================================
+
+// GET /policies - List policies with filters
+app.MapGet("/policies", async (
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    [FromQuery] string? insuredName,
+    [FromQuery] string? carrierName,
+    [FromQuery] string? status,
+    [FromQuery] DateOnly? effectiveAfter,
+    [FromQuery] DateOnly? effectiveBefore,
+    [FromQuery] int page = 1,
+    [FromQuery] int pageSize = 20) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var query = db.Policies
+        .Include(p => p.Coverages)
+        .Where(p => p.TenantId == currentUser.TenantId.Value);
+
+    // Apply filters
+    if (!string.IsNullOrWhiteSpace(insuredName))
+        query = query.Where(p => p.InsuredName != null &&
+            p.InsuredName.ToLower().Contains(insuredName.ToLower()));
+
+    if (!string.IsNullOrWhiteSpace(carrierName))
+        query = query.Where(p => p.CarrierName != null &&
+            p.CarrierName.ToLower().Contains(carrierName.ToLower()));
+
+    if (!string.IsNullOrWhiteSpace(status))
+        query = query.Where(p => p.PolicyStatus == status);
+
+    if (effectiveAfter.HasValue)
+        query = query.Where(p => p.EffectiveDate >= effectiveAfter.Value);
+
+    if (effectiveBefore.HasValue)
+        query = query.Where(p => p.EffectiveDate <= effectiveBefore.Value);
+
+    var totalCount = await query.CountAsync();
+
+    var policies = await query
+        .OrderByDescending(p => p.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .Select(p => new PolicyListItemDto
+        {
+            Id = p.Id,
+            PolicyNumber = p.PolicyNumber,
+            InsuredName = p.InsuredName,
+            CarrierName = p.CarrierName,
+            EffectiveDate = p.EffectiveDate,
+            ExpirationDate = p.ExpirationDate,
+            PolicyStatus = p.PolicyStatus,
+            TotalPremium = p.TotalPremium,
+            ExtractionConfidence = p.ExtractionConfidence,
+            CoverageCount = p.Coverages.Count,
+            CreatedAt = p.CreatedAt
+        })
+        .ToListAsync();
+
+    return Results.Ok(new PaginatedResponse<PolicyListItemDto>
+    {
+        Items = policies,
+        TotalCount = totalCount,
+        Page = page,
+        PageSize = pageSize
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetPolicies")
+.WithTags("Policies")
+.RequireRateLimiting("api");
+
+// GET /policies/{id} - Get policy details with coverages
+app.MapGet("/policies/{id:guid}", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var policy = await db.Policies
+        .Include(p => p.Coverages)
+        .Include(p => p.SourceDocument)
+        .FirstOrDefaultAsync(p => p.Id == id && p.TenantId == currentUser.TenantId.Value);
+
+    if (policy == null)
+        return Results.NotFound("Policy not found");
+
+    var dto = new PolicyDetailDto
+    {
+        Id = policy.Id,
+        SourceDocumentId = policy.SourceDocumentId,
+        SourceDocumentName = policy.SourceDocument?.FileName,
+        PolicyNumber = policy.PolicyNumber,
+        QuoteNumber = policy.QuoteNumber,
+        EffectiveDate = policy.EffectiveDate,
+        ExpirationDate = policy.ExpirationDate,
+        QuoteExpirationDate = policy.QuoteExpirationDate,
+        CarrierName = policy.CarrierName,
+        CarrierNaic = policy.CarrierNaic,
+        InsuredName = policy.InsuredName,
+        InsuredAddressLine1 = policy.InsuredAddressLine1,
+        InsuredAddressLine2 = policy.InsuredAddressLine2,
+        InsuredCity = policy.InsuredCity,
+        InsuredState = policy.InsuredState,
+        InsuredZip = policy.InsuredZip,
+        TotalPremium = policy.TotalPremium,
+        PolicyStatus = policy.PolicyStatus,
+        ExtractionConfidence = policy.ExtractionConfidence,
+        CreatedAt = policy.CreatedAt,
+        UpdatedAt = policy.UpdatedAt,
+        Coverages = policy.Coverages.Select(c => new CoverageDto
+        {
+            Id = c.Id,
+            CoverageType = c.CoverageType,
+            CoverageSubtype = c.CoverageSubtype,
+            EachOccurrenceLimit = c.EachOccurrenceLimit,
+            AggregateLimit = c.AggregateLimit,
+            Deductible = c.Deductible,
+            Premium = c.Premium,
+            IsOccurrenceForm = c.IsOccurrenceForm,
+            IsClaimsMade = c.IsClaimsMade,
+            RetroactiveDate = c.RetroactiveDate,
+            ExtractionConfidence = c.ExtractionConfidence,
+            Details = ParseCoverageDetails(c.Details)
+        }).ToList()
+    };
+
+    return Results.Ok(dto);
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetPolicy")
+.WithTags("Policies")
+.RequireRateLimiting("api");
+
+// GET /policies/{id}/summary - Get AI-generated policy summary
+app.MapGet("/policies/{id:guid}/summary", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    IClaudeExtractionService claudeService) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var policy = await db.Policies
+        .Include(p => p.Coverages)
+        .FirstOrDefaultAsync(p => p.Id == id && p.TenantId == currentUser.TenantId.Value);
+
+    if (policy == null)
+        return Results.NotFound("Policy not found");
+
+    // Build context for summary generation
+    var coverageSummary = string.Join("\n", policy.Coverages.Select(c =>
+        $"- {c.CoverageType}: Occurrence ${c.EachOccurrenceLimit:N0}, Aggregate ${c.AggregateLimit:N0}, Deductible ${c.Deductible:N0}"));
+
+    var prompt = $$"""
+        Summarize this insurance policy for a broker:
+
+        Policy: {{policy.PolicyNumber ?? "N/A"}}
+        Insured: {{policy.InsuredName}}
+        Carrier: {{policy.CarrierName}}
+        Effective: {{policy.EffectiveDate}} to {{policy.ExpirationDate}}
+        Premium: ${{policy.TotalPremium:N0}}
+
+        Coverages:
+        {{coverageSummary}}
+
+        Provide:
+        1. A 2-3 sentence summary
+        2. 3-5 key points
+        3. Any notable exclusions or gaps
+        4. Recommendations
+
+        Return as JSON:
+        {
+            "summary": "...",
+            "key_points": ["...", "..."],
+            "notable_exclusions": ["...", "..."],
+            "recommendations": ["...", "..."]
+        }
+        """;
+
+    try
+    {
+        var response = await claudeService.ExtractAsync<PolicySummaryResponse>(
+            "You are an insurance policy analyst. Provide clear, actionable summaries.",
+            prompt);
+
+        if (!response.Success || response.Result == null)
+        {
+            return Results.Problem($"Failed to generate summary: {response.Error ?? "Unknown error"}");
+        }
+
+        return Results.Ok(new PolicySummaryDto
+        {
+            PolicyId = policy.Id,
+            Summary = response.Result.Summary ?? "Unable to generate summary",
+            KeyPoints = response.Result.KeyPoints ?? [],
+            NotableExclusions = response.Result.NotableExclusions ?? [],
+            Recommendations = response.Result.Recommendations ?? []
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to generate summary: {ex.Message}");
+    }
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetPolicySummary")
+.WithTags("Policies")
+.RequireRateLimiting("api");
+
+// GET /documents/{id}/extraction-status - Get extraction status
+app.MapGet("/documents/{id:guid}/extraction-status", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var document = await db.Documents
+        .FirstOrDefaultAsync(d => d.Id == id && d.TenantId == currentUser.TenantId.Value);
+
+    if (document == null)
+        return Results.NotFound("Document not found");
+
+    var policy = await db.Policies
+        .Include(p => p.Coverages)
+        .FirstOrDefaultAsync(p => p.SourceDocumentId == id);
+
+    return Results.Ok(new ExtractionStatusDto
+    {
+        DocumentId = id,
+        Status = document.ProcessingStatus,
+        Error = document.ProcessingError,
+        ProcessedAt = document.ProcessedAt,
+        PolicyId = policy?.Id,
+        PolicyNumber = policy?.PolicyNumber,
+        CoveragesExtracted = policy?.Coverages.Count ?? 0,
+        ExtractionConfidence = policy?.ExtractionConfidence
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetExtractionStatus")
+.WithTags("Documents")
+.RequireRateLimiting("api");
+
+// POST /documents/{id}/reprocess - Re-run extraction
+app.MapPost("/documents/{id:guid}/reprocess", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    IBackgroundJobService jobService) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var document = await db.Documents
+        .FirstOrDefaultAsync(d => d.Id == id && d.TenantId == currentUser.TenantId.Value);
+
+    if (document == null)
+        return Results.NotFound("Document not found");
+
+    // Delete existing policies for this document (cascade deletes coverages)
+    var existingPolicies = await db.Policies
+        .Where(p => p.SourceDocumentId == id)
+        .ToListAsync();
+
+    if (existingPolicies.Count > 0)
+    {
+        db.Policies.RemoveRange(existingPolicies);
+    }
+
+    // Delete existing chunks
+    var existingChunks = await db.DocumentChunks
+        .Where(c => c.DocumentId == id)
+        .ToListAsync();
+
+    if (existingChunks.Count > 0)
+    {
+        db.DocumentChunks.RemoveRange(existingChunks);
+    }
+
+    // Reset document status
+    document.ProcessingStatus = "pending";
+    document.ProcessingError = null;
+    document.ProcessedAt = null;
+    await db.SaveChangesAsync();
+
+    // Queue reprocessing
+    jobService.Enqueue<IDocumentProcessingService>(
+        svc => svc.ProcessDocumentAsync(id, currentUser.TenantId.Value));
+
+    return Results.Accepted(value: new { documentId = id, status = "reprocessing" });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("ReprocessDocument")
+.WithTags("Documents")
+.RequireRateLimiting("api");
+
 app.Run();
 
 // Make Program accessible for integration tests
@@ -1379,4 +1692,40 @@ public partial class Program
         }
         return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
     }
+
+    /// <summary>
+    /// Parse coverage JSONB details string to dictionary.
+    /// </summary>
+    internal static Dictionary<string, JsonElement>? ParseCoverageDetails(string? detailsJson)
+    {
+        if (string.IsNullOrWhiteSpace(detailsJson) || detailsJson == "{}")
+            return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(detailsJson);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+
+/// <summary>
+/// Response model for policy summary generation.
+/// </summary>
+internal record PolicySummaryResponse
+{
+    [System.Text.Json.Serialization.JsonPropertyName("summary")]
+    public string? Summary { get; init; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("key_points")]
+    public List<string>? KeyPoints { get; init; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("notable_exclusions")]
+    public List<string>? NotableExclusions { get; init; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("recommendations")]
+    public List<string>? Recommendations { get; init; }
 }

@@ -20,6 +20,7 @@ public class DocumentProcessingService : IDocumentProcessingService
     private readonly IPdfTextExtractor _pdfExtractor;
     private readonly ITextChunker _textChunker;
     private readonly IEmbeddingService _embeddingService;
+    private readonly IExtractionPipeline _extractionPipeline;
     private readonly IEventPublisher _eventPublisher;
     private readonly ILogger<DocumentProcessingService> _logger;
 
@@ -32,6 +33,7 @@ public class DocumentProcessingService : IDocumentProcessingService
         IPdfTextExtractor pdfExtractor,
         ITextChunker textChunker,
         IEmbeddingService embeddingService,
+        IExtractionPipeline extractionPipeline,
         IEventPublisher eventPublisher,
         ILogger<DocumentProcessingService> logger)
     {
@@ -40,6 +42,7 @@ public class DocumentProcessingService : IDocumentProcessingService
         _pdfExtractor = pdfExtractor;
         _textChunker = textChunker;
         _embeddingService = embeddingService;
+        _extractionPipeline = extractionPipeline;
         _eventPublisher = eventPublisher;
         _logger = logger;
     }
@@ -132,26 +135,44 @@ public class DocumentProcessingService : IDocumentProcessingService
             _logger.LogDebug("Saving chunks to database");
             await SaveChunksAsync(document, chunks, embeddingResult.Embeddings);
 
-            // Step 7: Update document metadata
-            document.ProcessingStatus = "completed";
+            // Step 7: Update document metadata for text extraction phase
+            document.ProcessingStatus = "extracting";
             document.ProcessedAt = DateTime.UtcNow;
             document.PageCount = extractionResult.PageCount;
-            document.DocumentType = ClassifyDocument(document.FileName, extractionResult.FullText);
-
             await _dbContext.SaveChangesAsync();
+
+            _logger.LogInformation(
+                "Text extraction completed: {DocumentId}, {ChunkCount} chunks, {Tokens} tokens used. Starting structured extraction...",
+                documentId, chunks.Count, embeddingResult.TotalTokensUsed);
+
+            // Step 8: Run structured extraction (creates Policy + Coverage records)
+            var policyId = await _extractionPipeline.ExtractStructuredDataAsync(documentId, tenantId);
+
+            // Step 9: Update final status based on extraction result
+            // Note: ExtractionPipeline may have set status to "needs_review" or "extraction_failed"
+            // Only update to "completed" if extraction succeeded and status wasn't changed
+            document = await _dbContext.Documents
+                .IgnoreQueryFilters()
+                .FirstAsync(d => d.Id == documentId);
+
+            if (policyId.HasValue && document.ProcessingStatus == "extracting")
+            {
+                document.ProcessingStatus = "completed";
+                await _dbContext.SaveChangesAsync();
+            }
 
             // Publish success event
             await _eventPublisher.PublishAsync(new DocumentProcessedEvent
             {
                 DocumentId = documentId,
                 TenantId = tenantId,
-                Success = true,
-                Error = null
+                Success = policyId.HasValue,
+                Error = policyId.HasValue ? null : "Structured extraction failed"
             });
 
             _logger.LogInformation(
-                "Document processing completed: {DocumentId}, {ChunkCount} chunks, {Tokens} tokens used",
-                documentId, chunks.Count, embeddingResult.TotalTokensUsed);
+                "Document processing completed: {DocumentId}, Policy: {PolicyId}",
+                documentId, policyId?.ToString() ?? "none");
         }
         catch (Exception ex)
         {

@@ -39,3 +39,15 @@ public record DocumentProgressEvent : DomainEventBase
     public required int ProgressPercent { get; init; }
     public string? Message { get; init; }
 }
+
+/// <summary>
+/// Published when structured extraction completes (Policy + Coverages created).
+/// </summary>
+public record ExtractionCompletedEvent : DomainEventBase
+{
+    public required Guid DocumentId { get; init; }
+    public Guid? PolicyId { get; init; }
+    public required bool Success { get; init; }
+    public string? Error { get; init; }
+    public int CoveragesExtracted { get; init; }
+}

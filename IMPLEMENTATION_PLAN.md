@@ -1192,42 +1192,532 @@ ExtractionPipeline (Phase 8 - NEW)
 ---
 
 ## Phase 8: Complete Extraction Pipeline
-**Duration estimate: Integration**
+**Duration estimate: Integration - Wire Phase 7 services into the document processing flow**
 
-### 8.1 Pipeline Orchestrator
-- [ ] Create `ExtractionPipeline` service
-- [ ] Orchestrate all stages in sequence
-- [ ] Handle errors at each stage
-- [ ] Update processing status
-- [ ] Fire webhooks at completion
+### What Already Exists
+
+| Component | Location | Status |
+|-----------|----------|--------|
+| `DocumentProcessingService` | `Mnemo.Infrastructure/Services/` | ✅ Extracts text, chunks, embeds |
+| `ClaudeDocumentClassifier` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
+| `ClaudePolicyExtractor` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
+| 10 Coverage Extractors | `Mnemo.Extraction/Services/Extractors/` | ✅ Built in Phase 7 |
+| `CoverageExtractorFactory` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
+| `ExtractionValidator` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
+| `Policy` / `Coverage` entities | `Mnemo.Domain/Entities/` | ✅ Built in Phase 1 |
+| DbContext with Policies/Coverages | `Mnemo.Infrastructure/Persistence/` | ✅ Configured |
+| Document upload endpoints | `Mnemo.Api/Program.cs` | ✅ Lines 716-1075 |
+| Hangfire job trigger | `Mnemo.Api/Program.cs` | ✅ Lines 781, 879 |
+| Event infrastructure | SignalR + Webhooks | ✅ Built in Phase 3-4 |
+
+### What Phase 8 Builds
+
+| Component | Purpose |
+|-----------|---------|
+| `IExtractionPipeline` | Interface for structured extraction orchestrator |
+| `ExtractionPipeline` | Calls Phase 7 services, creates Policy/Coverage records |
+| Integration in `DocumentProcessingService` | Wire pipeline after chunking completes |
+| `PolicyDtos.cs` | DTOs for API responses |
+| Policy API endpoints | CRUD + summary endpoints |
+| Integration tests | End-to-end extraction verification |
+
+---
+
+### 8.1 ExtractionPipeline Service
+
+Create the orchestrator that calls Phase 7 services and persists results.
+
+#### 8.1.1 Interface Definition
+
+- [ ] Create `IExtractionPipeline` in `Mnemo.Application/Services/`:
+```csharp
+public interface IExtractionPipeline
+{
+    /// <summary>
+    /// Run structured extraction on a document that has been processed (text extracted, chunked).
+    /// Creates Policy and Coverage records in the database.
+    /// </summary>
+    /// <param name="documentId">Document with chunks already created</param>
+    /// <param name="tenantId">Tenant for isolation</param>
+    /// <returns>Created policy ID, or null if extraction failed</returns>
+    Task<Guid?> ExtractStructuredDataAsync(Guid documentId, Guid tenantId, CancellationToken ct = default);
+}
+```
+
+#### 8.1.2 Implementation
+
+- [ ] Create `ExtractionPipeline` in `Mnemo.Infrastructure/Services/`:
+
+**Constructor dependencies:**
+```csharp
+public ExtractionPipeline(
+    MnemoDbContext dbContext,
+    IDocumentClassifier documentClassifier,
+    IPolicyExtractor policyExtractor,
+    ICoverageExtractorFactory coverageExtractorFactory,
+    IExtractionValidator validator,
+    IEventPublisher eventPublisher,
+    ILogger<ExtractionPipeline> logger)
+```
+
+**ExtractStructuredDataAsync flow:**
+```
+1. Load document with chunks from database
+2. Reconstruct full text from chunks for classification
+3. Call IDocumentClassifier.ClassifyAsync()
+   - Update Document.DocumentType
+   - Get list of coverages detected
+4. Get declaration chunks (section_type = "declarations" or first chunks)
+5. Call IPolicyExtractor.ExtractAsync() with declaration text
+   - Map PolicyExtractionResult → Policy entity
+   - Set Policy.SourceDocumentId, TenantId, ExtractionConfidence
+6. For each coverage detected:
+   a. Get extractor from ICoverageExtractorFactory
+   b. Get relevant chunks for that coverage type
+   c. Call extractor.ExtractAsync()
+   d. Map CoverageExtractionResult → Coverage entity
+   e. Set Coverage.PolicyId, ExtractionConfidence
+7. Call IExtractionValidator.ValidateComplete()
+   - If validation errors, set Document.ProcessingStatus = "needs_review"
+   - Store validation warnings in Policy.RawExtraction
+8. Save all in transaction:
+   - Policy record
+   - Coverage records
+   - Update Document status
+9. Publish ExtractionCompletedEvent
+10. Return Policy.Id
+```
+
+**Error handling:**
+- Wrap in try-catch, log errors
+- On failure: set Document.ProcessingStatus = "extraction_failed"
+- Store error in Document.ProcessingError
+- Publish failure event
+- Return null (don't throw - let job complete)
+
+#### 8.1.3 New Domain Event
+
+- [ ] Add to `Mnemo.Domain/Events/DocumentEvents.cs`:
+```csharp
+public record ExtractionCompletedEvent : DomainEventBase
+{
+    public required Guid DocumentId { get; init; }
+    public required Guid? PolicyId { get; init; }
+    public required bool Success { get; init; }
+    public string? Error { get; init; }
+    public int CoveragesExtracted { get; init; }
+}
+```
+
+#### 8.1.4 Register in DI
+
+- [ ] Add to `Program.cs` service registration:
+```csharp
+builder.Services.AddScoped<IExtractionPipeline, ExtractionPipeline>();
+```
 
 **🧪 Test checkpoint 8.1:**
-- [ ] Full pipeline runs end-to-end
-- [ ] Status updates correctly
-- [ ] Webhook fires on completion
-- [ ] WebSocket broadcasts status
+- [ ] Unit test: ExtractionPipeline calls all services in correct order
+- [ ] Unit test: Transaction rolls back on partial failure
+- [ ] Unit test: Validation errors set "needs_review" status
+- [ ] Unit test: Event published on completion
 
-### 8.2 Extraction Endpoints
-- [ ] `GET /documents/{id}/status` - processing status
-- [ ] Trigger extraction on upload
-- [ ] Handle re-extraction requests
+---
+
+### 8.2 Integration with DocumentProcessingService
+
+Wire the pipeline to run after text extraction completes.
+
+#### 8.2.1 Update DocumentProcessingService
+
+- [ ] Add `IExtractionPipeline` to constructor
+- [ ] After Step 7 (save chunks), call extraction pipeline:
+
+```csharp
+// Step 7: Update document metadata (existing)
+document.ProcessingStatus = "extracting"; // NEW intermediate status
+document.ProcessedAt = DateTime.UtcNow;
+document.PageCount = extractionResult.PageCount;
+await _dbContext.SaveChangesAsync();
+
+// Step 8: Run structured extraction (NEW)
+_logger.LogDebug("Running structured extraction for {DocumentId}", documentId);
+var policyId = await _extractionPipeline.ExtractStructuredDataAsync(documentId, tenantId);
+
+if (policyId.HasValue)
+{
+    document.ProcessingStatus = "completed";
+    _logger.LogInformation("Extraction complete: Policy {PolicyId} created", policyId);
+}
+else
+{
+    document.ProcessingStatus = "extraction_failed";
+    _logger.LogWarning("Structured extraction failed for {DocumentId}", documentId);
+}
+await _dbContext.SaveChangesAsync();
+
+// Step 9: Publish completion event (existing, update to include policyId)
+```
+
+#### 8.2.2 Update Processing Status Enum
+
+- [ ] Document.ProcessingStatus values:
+  - `pending` - Uploaded, waiting for processing
+  - `processing` - Text extraction in progress
+  - `extracting` - Structured extraction in progress (NEW)
+  - `completed` - All done
+  - `needs_review` - Low confidence, needs human review (NEW)
+  - `failed` - Text extraction failed
+  - `extraction_failed` - Structured extraction failed (NEW)
 
 **🧪 Test checkpoint 8.2:**
-- [ ] Upload triggers extraction
-- [ ] Status endpoint accurate
-- [ ] Re-extraction works
+- [ ] Upload document → job creates Policy + Coverages
+- [ ] Status transitions: pending → processing → extracting → completed
+- [ ] Re-upload same document replaces existing Policy
+- [ ] Failed extraction sets correct status
 
-### 8.3 Policy Endpoints
-- [ ] `GET /policies` - list with filters
-- [ ] `GET /policies/{id}` - full details with coverages
-- [ ] `GET /policies/{id}/summary` - AI summary
+---
+
+### 8.3 Policy DTOs
+
+Create DTOs for API responses.
+
+- [ ] Create `PolicyDtos.cs` in `Mnemo.Application/DTOs/`:
+
+```csharp
+// List item (minimal)
+public record PolicyListItemDto
+{
+    public Guid Id { get; init; }
+    public string? PolicyNumber { get; init; }
+    public string? InsuredName { get; init; }
+    public string? CarrierName { get; init; }
+    public DateOnly? EffectiveDate { get; init; }
+    public DateOnly? ExpirationDate { get; init; }
+    public string PolicyStatus { get; init; } = "quote";
+    public decimal? TotalPremium { get; init; }
+    public decimal? ExtractionConfidence { get; init; }
+    public int CoverageCount { get; init; }
+    public DateTime CreatedAt { get; init; }
+}
+
+// Full details
+public record PolicyDetailDto
+{
+    public Guid Id { get; init; }
+    public Guid? SourceDocumentId { get; init; }
+    public string? SourceDocumentName { get; init; }
+
+    // All Policy fields...
+    public string? PolicyNumber { get; init; }
+    public string? QuoteNumber { get; init; }
+    public DateOnly? EffectiveDate { get; init; }
+    public DateOnly? ExpirationDate { get; init; }
+    public string? CarrierName { get; init; }
+    public string? CarrierNaic { get; init; }
+    public string? InsuredName { get; init; }
+    public string? InsuredAddressLine1 { get; init; }
+    public string? InsuredAddressLine2 { get; init; }
+    public string? InsuredCity { get; init; }
+    public string? InsuredState { get; init; }
+    public string? InsuredZip { get; init; }
+    public decimal? TotalPremium { get; init; }
+    public string PolicyStatus { get; init; } = "quote";
+    public decimal? ExtractionConfidence { get; init; }
+    public DateTime CreatedAt { get; init; }
+
+    // Nested coverages
+    public List<CoverageDto> Coverages { get; init; } = [];
+}
+
+// Coverage DTO
+public record CoverageDto
+{
+    public Guid Id { get; init; }
+    public string CoverageType { get; init; } = "";
+    public string? CoverageSubtype { get; init; }
+    public decimal? EachOccurrenceLimit { get; init; }
+    public decimal? AggregateLimit { get; init; }
+    public decimal? Deductible { get; init; }
+    public decimal? Premium { get; init; }
+    public bool? IsOccurrenceForm { get; init; }
+    public bool? IsClaimsMade { get; init; }
+    public DateOnly? RetroactiveDate { get; init; }
+    public decimal? ExtractionConfidence { get; init; }
+
+    // Parsed JSONB details
+    public Dictionary<string, object>? Details { get; init; }
+}
+
+// Summary (AI-generated)
+public record PolicySummaryDto
+{
+    public Guid PolicyId { get; init; }
+    public string Summary { get; init; } = "";
+    public List<string> KeyPoints { get; init; } = [];
+    public List<string> NotableExclusions { get; init; } = [];
+    public List<string> Recommendations { get; init; } = [];
+}
+```
 
 **🧪 Test checkpoint 8.3:**
-- [ ] List/filter works
-- [ ] Details include all coverages
-- [ ] Summary generates correctly
+- [ ] DTOs serialize correctly to JSON
+- [ ] Coverage.Details JSONB parses to Dictionary
 
-**⚠️ DECISION GATE 8.3:** Full extraction pipeline review. Ready for chat?
+---
+
+### 8.4 Policy API Endpoints
+
+Add endpoints to `Program.cs`.
+
+#### 8.4.1 List Policies
+
+- [ ] `GET /policies` - List with filters
+
+```csharp
+app.MapGet("/policies", async (
+    [FromQuery] string? insuredName,
+    [FromQuery] string? carrierName,
+    [FromQuery] string? status,
+    [FromQuery] DateOnly? effectiveAfter,
+    [FromQuery] DateOnly? effectiveBefore,
+    [FromQuery] int page = 1,
+    [FromQuery] int pageSize = 20,
+    ICurrentUserService currentUser,
+    MnemoDbContext dbContext) =>
+{
+    if (currentUser.TenantId is null)
+        return Results.Unauthorized();
+
+    var query = dbContext.Policies
+        .Include(p => p.Coverages)
+        .Where(p => p.TenantId == currentUser.TenantId);
+
+    // Apply filters...
+    // Return PolicyListItemDto[]
+})
+.RequireAuthorization("RequireTenant");
+```
+
+#### 8.4.2 Get Policy Details
+
+- [ ] `GET /policies/{id}` - Full details with coverages
+
+```csharp
+app.MapGet("/policies/{id:guid}", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext dbContext) =>
+{
+    var policy = await dbContext.Policies
+        .Include(p => p.Coverages)
+        .Include(p => p.SourceDocument)
+        .FirstOrDefaultAsync(p => p.Id == id);
+
+    if (policy is null)
+        return Results.NotFound();
+
+    // Map to PolicyDetailDto
+})
+.RequireAuthorization("RequireTenant");
+```
+
+#### 8.4.3 Get Policy Summary
+
+- [ ] `GET /policies/{id}/summary` - AI-generated summary
+
+```csharp
+app.MapGet("/policies/{id:guid}/summary", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext dbContext,
+    IClaudeExtractionService claudeService) =>
+{
+    var policy = await dbContext.Policies
+        .Include(p => p.Coverages)
+        .FirstOrDefaultAsync(p => p.Id == id);
+
+    if (policy is null)
+        return Results.NotFound();
+
+    // Generate summary using Claude
+    var summary = await GeneratePolicySummary(policy, claudeService);
+    return Results.Ok(summary);
+})
+.RequireAuthorization("RequireTenant");
+```
+
+#### 8.4.4 Re-extract Document
+
+- [ ] `POST /documents/{id}/reprocess` - Re-run extraction
+
+```csharp
+app.MapPost("/documents/{id:guid}/reprocess", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext dbContext,
+    IBackgroundJobService jobService) =>
+{
+    var document = await dbContext.Documents
+        .FirstOrDefaultAsync(d => d.Id == id);
+
+    if (document is null)
+        return Results.NotFound();
+
+    // Delete existing policy/coverages for this document
+    var existingPolicies = await dbContext.Policies
+        .Where(p => p.SourceDocumentId == id)
+        .ToListAsync();
+    dbContext.Policies.RemoveRange(existingPolicies);
+
+    // Reset document status
+    document.ProcessingStatus = "pending";
+    document.ProcessingError = null;
+    await dbContext.SaveChangesAsync();
+
+    // Queue reprocessing
+    await jobService.EnqueueAsync<IDocumentProcessingService>(
+        svc => svc.ProcessDocumentAsync(id, currentUser.TenantId!.Value));
+
+    return Results.Accepted();
+})
+.RequireAuthorization("RequireTenant");
+```
+
+#### 8.4.5 Get Document Extraction Status
+
+- [ ] `GET /documents/{id}/extraction-status` - Detailed extraction status
+
+```csharp
+app.MapGet("/documents/{id:guid}/extraction-status", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext dbContext) =>
+{
+    var document = await dbContext.Documents
+        .FirstOrDefaultAsync(d => d.Id == id);
+
+    if (document is null)
+        return Results.NotFound();
+
+    var policy = await dbContext.Policies
+        .Include(p => p.Coverages)
+        .FirstOrDefaultAsync(p => p.SourceDocumentId == id);
+
+    return Results.Ok(new
+    {
+        documentId = id,
+        status = document.ProcessingStatus,
+        error = document.ProcessingError,
+        processedAt = document.ProcessedAt,
+        policyId = policy?.Id,
+        policyNumber = policy?.PolicyNumber,
+        coveragesExtracted = policy?.Coverages.Count ?? 0,
+        extractionConfidence = policy?.ExtractionConfidence
+    });
+})
+.RequireAuthorization("RequireTenant");
+```
+
+**🧪 Test checkpoint 8.4:**
+- [ ] `GET /policies` returns list with correct filters
+- [ ] `GET /policies/{id}` returns full details with coverages
+- [ ] `GET /policies/{id}/summary` generates AI summary
+- [ ] `POST /documents/{id}/reprocess` triggers re-extraction
+- [ ] `GET /documents/{id}/extraction-status` shows extraction details
+
+---
+
+### 8.5 Integration Tests
+
+End-to-end tests with real Claude API.
+
+- [ ] Create `ExtractionPipelineIntegrationTests.cs` in `Mnemo.Extraction.Tests/IntegrationTests/`:
+
+```csharp
+[Fact]
+public async Task FullPipeline_UploadDocument_CreatesPolicyAndCoverages()
+{
+    // 1. Upload sample PDF via API (or mock storage)
+    // 2. Wait for processing to complete
+    // 3. Verify Policy record created with correct fields
+    // 4. Verify Coverage records created
+    // 5. Verify Document.ProcessingStatus = "completed"
+}
+
+[Fact]
+public async Task Reprocess_DeletesOldPolicyAndCreatesNew()
+{
+    // 1. Process document
+    // 2. Call reprocess endpoint
+    // 3. Verify old policy deleted
+    // 4. Verify new policy created
+}
+
+[Fact]
+public async Task LowConfidenceExtraction_SetsNeedsReviewStatus()
+{
+    // 1. Process document with ambiguous content
+    // 2. Verify status = "needs_review"
+    // 3. Verify validation warnings stored
+}
+```
+
+- [ ] Create `PolicyEndpointTests.cs` in `Mnemo.Api.Tests/`:
+
+```csharp
+[Fact]
+public async Task GetPolicies_ReturnsFilteredList()
+
+[Fact]
+public async Task GetPolicy_ReturnsDetailsWithCoverages()
+
+[Fact]
+public async Task GetPolicySummary_GeneratesAISummary()
+
+[Fact]
+public async Task TenantIsolation_CannotAccessOtherTenantPolicies()
+```
+
+**🧪 Test checkpoint 8.5:**
+- [ ] All integration tests pass with real Claude API
+- [ ] All endpoint tests pass
+- [ ] Tenant isolation verified
+
+---
+
+### 8.6 Files to Create/Modify
+
+| Action | File | Description |
+|--------|------|-------------|
+| CREATE | `src/Mnemo.Application/Services/IExtractionPipeline.cs` | Interface |
+| CREATE | `src/Mnemo.Infrastructure/Services/ExtractionPipeline.cs` | Implementation |
+| CREATE | `src/Mnemo.Application/DTOs/PolicyDtos.cs` | DTOs |
+| MODIFY | `src/Mnemo.Domain/Events/DocumentEvents.cs` | Add ExtractionCompletedEvent |
+| MODIFY | `src/Mnemo.Infrastructure/Services/DocumentProcessingService.cs` | Wire in pipeline |
+| MODIFY | `src/Mnemo.Api/Program.cs` | Add policy endpoints, DI registration |
+| CREATE | `tests/Mnemo.Extraction.Tests/IntegrationTests/ExtractionPipelineIntegrationTests.cs` | E2E tests |
+| CREATE | `tests/Mnemo.Api.Tests/PolicyEndpointTests.cs` | API tests |
+
+---
+
+### 8.7 Verification Checklist
+
+Before marking Phase 8 complete:
+
+- [ ] Upload PDF → Background job runs → Policy + Coverages in database
+- [ ] `GET /policies` returns extracted policies
+- [ ] `GET /policies/{id}` returns full details with all coverages
+- [ ] `GET /policies/{id}/summary` generates helpful AI summary
+- [ ] `POST /documents/{id}/reprocess` re-runs extraction successfully
+- [ ] `GET /documents/{id}/extraction-status` shows extraction details
+- [ ] Webhook fires when extraction completes
+- [ ] SignalR broadcasts extraction progress/completion
+- [ ] Low-confidence extractions flagged for review
+- [ ] All tests pass (unit + integration)
+- [ ] Tenant isolation verified (Tenant A cannot see Tenant B policies)
+
+**⚠️ DECISION GATE 8:** Full extraction pipeline review. Upload sample policies from `/samples/`, verify extraction accuracy, review API responses. Ready for RAG chat?
 
 ---
 

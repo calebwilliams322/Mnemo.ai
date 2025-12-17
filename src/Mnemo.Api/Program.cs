@@ -20,6 +20,8 @@ using Mnemo.Infrastructure.Persistence;
 using Mnemo.Infrastructure.Services;
 using Mnemo.Api.EventHandlers;
 using Mnemo.Domain.Events;
+using Mnemo.Infrastructure.EventHandlers;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -90,11 +92,19 @@ builder.Services.AddSignalR();
 // Register SignalR notification service
 builder.Services.AddScoped<INotificationService, SignalRNotificationService>();
 
-// Register document event handlers (Phase 4 webhooks will also subscribe to these events)
+// Register document event handlers for SignalR notifications
 builder.Services.AddScoped<IEventHandler<DocumentUploadedEvent>, DocumentUploadedEventHandler>();
 builder.Services.AddScoped<IEventHandler<DocumentProcessingStartedEvent>, DocumentProcessingStartedEventHandler>();
 builder.Services.AddScoped<IEventHandler<DocumentProgressEvent>, DocumentProgressEventHandler>();
 builder.Services.AddScoped<IEventHandler<DocumentProcessedEvent>, DocumentProcessedEventHandler>();
+
+// Register Webhook Service
+builder.Services.AddScoped<IWebhookService, WebhookService>();
+
+// Register webhook event handlers (subscribe to same events as SignalR)
+builder.Services.AddScoped<IEventHandler<DocumentUploadedEvent>, WebhookDocumentUploadedHandler>();
+builder.Services.AddScoped<IEventHandler<DocumentProcessingStartedEvent>, WebhookDocumentProcessingStartedHandler>();
+builder.Services.AddScoped<IEventHandler<DocumentProcessedEvent>, WebhookDocumentProcessedHandler>();
 
 // Configure JWT Authentication with Supabase
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -1049,6 +1059,275 @@ app.MapDelete("/documents/{id:guid}", async (
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("DeleteDocument")
 .WithTags("Documents")
+.RequireRateLimiting("api");
+
+// ==================== Webhook Endpoints ====================
+
+// POST /webhooks - Create a new webhook
+app.MapPost("/webhooks", async (
+    CreateWebhookRequest request,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    // Validate URL
+    if (string.IsNullOrWhiteSpace(request.Url) || !Uri.TryCreate(request.Url, UriKind.Absolute, out var uri))
+        return Results.BadRequest("Valid URL is required");
+
+    if (uri.Scheme != "https" && uri.Scheme != "http")
+        return Results.BadRequest("URL must use HTTP or HTTPS");
+
+    // Validate events
+    if (request.Events == null || request.Events.Count == 0)
+        return Results.BadRequest("At least one event type is required");
+
+    foreach (var evt in request.Events)
+    {
+        if (!WebhookEventTypes.IsValid(evt) && evt != "*")
+            return Results.BadRequest($"Invalid event type: {evt}. Valid types: {string.Join(", ", WebhookEventTypes.All)}");
+    }
+
+    var webhook = new Webhook
+    {
+        Id = Guid.NewGuid(),
+        TenantId = currentUser.TenantId.Value,
+        Url = request.Url,
+        Events = JsonSerializer.Serialize(request.Events),
+        Secret = request.Secret,
+        IsActive = true,
+        CreatedAt = DateTime.UtcNow
+    };
+
+    db.Webhooks.Add(webhook);
+    await db.SaveChangesAsync();
+
+    logger.LogInformation(
+        "Webhook created: {WebhookId} for tenant {TenantId}",
+        webhook.Id, currentUser.TenantId);
+
+    return Results.Created($"/webhooks/{webhook.Id}", new WebhookDto(
+        webhook.Id,
+        webhook.Url,
+        request.Events,
+        webhook.IsActive,
+        webhook.ConsecutiveFailures,
+        webhook.CreatedAt,
+        webhook.UpdatedAt));
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("CreateWebhook")
+.WithTags("Webhooks")
+.RequireRateLimiting("api");
+
+// GET /webhooks - List webhooks for tenant
+app.MapGet("/webhooks", async (
+    ICurrentUserService currentUser,
+    MnemoDbContext db) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var webhooks = await db.Webhooks
+        .Where(w => w.TenantId == currentUser.TenantId.Value)
+        .OrderByDescending(w => w.CreatedAt)
+        .ToListAsync();
+
+    var result = webhooks.Select(w => new WebhookDto(
+        w.Id,
+        w.Url,
+        JsonSerializer.Deserialize<List<string>>(w.Events) ?? [],
+        w.IsActive,
+        w.ConsecutiveFailures,
+        w.CreatedAt,
+        w.UpdatedAt));
+
+    return Results.Ok(result);
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("ListWebhooks")
+.WithTags("Webhooks")
+.RequireRateLimiting("api");
+
+// GET /webhooks/{id} - Get webhook details
+app.MapGet("/webhooks/{id:guid}", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var webhook = await db.Webhooks
+        .Where(w => w.Id == id && w.TenantId == currentUser.TenantId.Value)
+        .FirstOrDefaultAsync();
+
+    if (webhook == null)
+        return Results.NotFound("Webhook not found");
+
+    return Results.Ok(new WebhookDto(
+        webhook.Id,
+        webhook.Url,
+        JsonSerializer.Deserialize<List<string>>(webhook.Events) ?? new List<string>(),
+        webhook.IsActive,
+        webhook.ConsecutiveFailures,
+        webhook.CreatedAt,
+        webhook.UpdatedAt));
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("GetWebhook")
+.WithTags("Webhooks")
+.RequireRateLimiting("api");
+
+// PATCH /webhooks/{id} - Update webhook
+app.MapPatch("/webhooks/{id:guid}", async (
+    Guid id,
+    UpdateWebhookRequest request,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var webhook = await db.Webhooks
+        .Where(w => w.Id == id && w.TenantId == currentUser.TenantId.Value)
+        .FirstOrDefaultAsync();
+
+    if (webhook == null)
+        return Results.NotFound("Webhook not found");
+
+    if (request.Url != null)
+    {
+        if (!Uri.TryCreate(request.Url, UriKind.Absolute, out var uri))
+            return Results.BadRequest("Valid URL is required");
+        webhook.Url = request.Url;
+    }
+
+    if (request.Events != null)
+    {
+        foreach (var evt in request.Events)
+        {
+            if (!WebhookEventTypes.IsValid(evt) && evt != "*")
+                return Results.BadRequest($"Invalid event type: {evt}");
+        }
+        webhook.Events = JsonSerializer.Serialize(request.Events);
+    }
+
+    if (request.Secret != null)
+        webhook.Secret = request.Secret;
+
+    if (request.IsActive.HasValue)
+    {
+        webhook.IsActive = request.IsActive.Value;
+        // Reset failure count when re-enabling
+        if (request.IsActive.Value)
+            webhook.ConsecutiveFailures = 0;
+    }
+
+    webhook.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    logger.LogInformation("Webhook updated: {WebhookId}", webhook.Id);
+
+    return Results.Ok(new WebhookDto(
+        webhook.Id,
+        webhook.Url,
+        JsonSerializer.Deserialize<List<string>>(webhook.Events) ?? new List<string>(),
+        webhook.IsActive,
+        webhook.ConsecutiveFailures,
+        webhook.CreatedAt,
+        webhook.UpdatedAt));
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("UpdateWebhook")
+.WithTags("Webhooks")
+.RequireRateLimiting("api");
+
+// DELETE /webhooks/{id} - Delete webhook
+app.MapDelete("/webhooks/{id:guid}", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var webhook = await db.Webhooks
+        .Where(w => w.Id == id && w.TenantId == currentUser.TenantId.Value)
+        .FirstOrDefaultAsync();
+
+    if (webhook == null)
+        return Results.NotFound("Webhook not found");
+
+    db.Webhooks.Remove(webhook);
+    await db.SaveChangesAsync();
+
+    logger.LogInformation("Webhook deleted: {WebhookId}", webhook.Id);
+
+    return Results.NoContent();
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("DeleteWebhook")
+.WithTags("Webhooks")
+.RequireRateLimiting("api");
+
+// GET /webhooks/{id}/deliveries - Get delivery history
+app.MapGet("/webhooks/{id:guid}/deliveries", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    int page = 1,
+    int pageSize = 20) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    // Verify webhook belongs to tenant
+    var webhookExists = await db.Webhooks
+        .AnyAsync(w => w.Id == id && w.TenantId == currentUser.TenantId.Value);
+
+    if (!webhookExists)
+        return Results.NotFound("Webhook not found");
+
+    var totalCount = await db.WebhookDeliveries
+        .CountAsync(d => d.WebhookId == id);
+
+    var deliveries = await db.WebhookDeliveries
+        .Where(d => d.WebhookId == id)
+        .OrderByDescending(d => d.CreatedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .Select(d => new WebhookDeliveryDto(
+            d.Id,
+            d.WebhookId,
+            d.Event,
+            d.Status,
+            d.ResponseStatusCode,
+            d.ErrorMessage,
+            d.AttemptCount,
+            d.CreatedAt,
+            d.DeliveredAt))
+        .ToListAsync();
+
+    return Results.Ok(new
+    {
+        data = deliveries,
+        pagination = new
+        {
+            page,
+            pageSize,
+            totalCount,
+            totalPages = (int)Math.Ceiling(totalCount / (double)pageSize)
+        }
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireAdmin)
+.WithName("GetWebhookDeliveries")
+.WithTags("Webhooks")
 .RequireRateLimiting("api");
 
 app.Run();

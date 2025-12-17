@@ -17,16 +17,14 @@ public static class ExtractionServiceCollectionExtensions
     /// Required settings sections:
     /// - "Claude" -> ClaudeExtractionSettings (ApiKey, Model, MaxTokens)
     /// - "OpenAI" -> OpenAISettings (ApiKey, EmbeddingModel)
+    ///
+    /// The extraction pipeline uses unified single-call extraction (proven approach).
     /// </remarks>
     public static IServiceCollection AddExtractionServices(
         this IServiceCollection services)
     {
-        // Register core extraction services
+        // Core Claude extraction service (used for unified extraction)
         services.AddSingleton<IClaudeExtractionService, ClaudeExtractionService>();
-        services.AddSingleton<IDocumentClassifier, ClaudeDocumentClassifier>();
-        services.AddSingleton<IPolicyExtractor, ClaudePolicyExtractor>();
-        services.AddSingleton<ICoverageExtractorFactory, CoverageExtractorFactory>();
-        services.AddSingleton<IExtractionValidator, ExtractionValidator>();
 
         // PDF and text processing services
         services.AddSingleton<IPdfTextExtractor, PdfPigTextExtractor>();

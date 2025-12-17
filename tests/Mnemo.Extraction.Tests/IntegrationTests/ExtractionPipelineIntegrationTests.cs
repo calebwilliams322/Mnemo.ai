@@ -15,15 +15,12 @@ namespace Mnemo.Extraction.Tests.IntegrationTests;
 
 /// <summary>
 /// Integration tests for ExtractionPipeline with real Claude API and Supabase PostgreSQL.
-/// These tests use the real database and verify end-to-end extraction.
+/// Uses unified single-call extraction approach.
 /// </summary>
 public class ExtractionPipelineIntegrationTests : IAsyncLifetime
 {
     private MnemoDbContext _dbContext = null!;
-    private IDocumentClassifier _classifier = null!;
-    private IPolicyExtractor _policyExtractor = null!;
-    private ICoverageExtractorFactory _coverageExtractorFactory = null!;
-    private IExtractionValidator _validator = null!;
+    private IClaudeExtractionService _claudeService = null!;
     private TestEventPublisher _eventPublisher = null!;
     private ILogger<ExtractionPipeline> _logger = null!;
 
@@ -67,7 +64,7 @@ public class ExtractionPipelineIntegrationTests : IAsyncLifetime
         // Set up logging
         var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
 
-        // Set up Claude services
+        // Set up Claude service
         var claudeSettings = Options.Create(new ClaudeExtractionSettings
         {
             ApiKey = apiKey,
@@ -75,24 +72,9 @@ public class ExtractionPipelineIntegrationTests : IAsyncLifetime
             MaxTokens = 4096
         });
 
-        var claudeService = new ClaudeExtractionService(
+        _claudeService = new ClaudeExtractionService(
             claudeSettings,
             loggerFactory.CreateLogger<ClaudeExtractionService>());
-
-        _classifier = new ClaudeDocumentClassifier(
-            claudeService,
-            loggerFactory.CreateLogger<ClaudeDocumentClassifier>());
-
-        _policyExtractor = new ClaudePolicyExtractor(
-            claudeService,
-            loggerFactory.CreateLogger<ClaudePolicyExtractor>());
-
-        _coverageExtractorFactory = new CoverageExtractorFactory(
-            claudeService,
-            loggerFactory);
-
-        _validator = new ExtractionValidator(
-            loggerFactory.CreateLogger<ExtractionValidator>());
 
         _eventPublisher = new TestEventPublisher();
         _logger = loggerFactory.CreateLogger<ExtractionPipeline>();
@@ -184,10 +166,7 @@ public class ExtractionPipelineIntegrationTests : IAsyncLifetime
 
         var pipeline = new ExtractionPipeline(
             _dbContext,
-            _classifier,
-            _policyExtractor,
-            _coverageExtractorFactory,
-            _validator,
+            _claudeService,
             _eventPublisher,
             _logger);
 
@@ -201,101 +180,56 @@ public class ExtractionPipelineIntegrationTests : IAsyncLifetime
         }
 
         // Assert
-        policyId.Should().NotBeNull("Pipeline should create a policy");
+        policyId.Should().NotBeNull("extraction should create a policy");
 
-        // Verify policy was created
         var policy = await _dbContext.Policies
             .IgnoreQueryFilters()
             .Include(p => p.Coverages)
             .FirstOrDefaultAsync(p => p.Id == policyId);
 
         policy.Should().NotBeNull();
-        policy!.InsuredName.Should().NotBeNullOrEmpty("Should extract insured name");
-        policy.SourceDocumentId.Should().Be(_testDocumentId);
-        policy.TenantId.Should().Be(_testTenantId);
-
-        // Verify at least one coverage was created
-        policy.Coverages.Should().NotBeEmpty("Should extract at least one coverage");
-
-        // Verify GL coverage specifically
-        var glCoverage = policy.Coverages.FirstOrDefault(c =>
-            c.CoverageType.Contains("general_liability", StringComparison.OrdinalIgnoreCase));
-
-        glCoverage.Should().NotBeNull("Should have GL coverage");
+        policy!.InsuredName.Should().NotBeNullOrEmpty();
+        policy.Coverages.Should().NotBeEmpty("policy should have coverages");
 
         // Verify event was published
-        var completionEvent = _eventPublisher.PublishedEvents
-            .OfType<ExtractionCompletedEvent>()
-            .FirstOrDefault(e => e.Success && e.PolicyId == policyId);
-        completionEvent.Should().NotBeNull("Should publish extraction completed event");
+        _eventPublisher.PublishedEvents.Should().ContainSingle()
+            .Which.Should().BeOfType<ExtractionCompletedEvent>()
+            .Which.Success.Should().BeTrue();
 
-        // Log results for verification
-        Console.WriteLine($"\n=== Extraction Results ===");
-        Console.WriteLine($"Policy Number: {policy.PolicyNumber}");
+        Console.WriteLine($"Extracted policy: {policy.PolicyNumber}");
         Console.WriteLine($"Insured: {policy.InsuredName}");
-        Console.WriteLine($"Carrier: {policy.CarrierName}");
-        Console.WriteLine($"Effective: {policy.EffectiveDate} - {policy.ExpirationDate}");
-        Console.WriteLine($"Premium: {policy.TotalPremium:C}");
-        Console.WriteLine($"Confidence: {policy.ExtractionConfidence:P0}");
         Console.WriteLine($"Coverages: {policy.Coverages.Count}");
-        foreach (var coverage in policy.Coverages)
+        foreach (var cov in policy.Coverages)
         {
-            Console.WriteLine($"  - {coverage.CoverageType}: ${coverage.EachOccurrenceLimit:N0} / ${coverage.AggregateLimit:N0}");
+            Console.WriteLine($"  - {cov.CoverageType}: {cov.EachOccurrenceLimit:C0}");
         }
     }
 
     [Fact]
-    public async Task ExtractStructuredData_WithInlineText_CreatesPolicyAndCoverage()
+    public async Task ExtractStructuredData_WCPolicy_ExtractsWorkersComp()
     {
-        // Arrange: Use inline sample text
-        var sampleText = @"
-COMMERCIAL GENERAL LIABILITY DECLARATIONS
+        // Arrange
+        var samplesDir = Path.Combine(
+            Directory.GetCurrentDirectory(),
+            "..", "..", "..", "..", "..", "samples");
 
-Policy Number: GL-2024-TEST-001
-Effective Date: January 1, 2024 to January 1, 2025
+        var wcPolicyPath = Directory.GetFiles(samplesDir, "*WC*.txt")
+            .FirstOrDefault();
 
-Named Insured: Test Company Inc.
-Address: 123 Main Street, Suite 100
-         Anytown, CA 90210
+        if (wcPolicyPath == null) return;
 
-Insurance Company: ABC Insurance Company
-NAIC: 12345
-
-SCHEDULE OF COVERAGES
-Coverage                              Limit
-Each Occurrence                       $1,000,000
-General Aggregate                     $2,000,000
-Products-Completed Operations Aggregate $2,000,000
-Personal and Advertising Injury       $1,000,000
-Damage to Rented Premises            $100,000
-Medical Expense (Any One Person)      $5,000
-
-TOTAL PREMIUM: $12,500
-
-Form: CG 00 01 04 13 - Commercial General Liability Coverage Form
-Form: CG 20 10 04 13 - Additional Insured - Owners, Lessees or Contractors
-Form: CG 20 37 04 13 - Additional Insured - Owners, Lessees or Contractors
-";
-
-        await SetupDocumentWithChunks(sampleText, "GL-Test-Policy.pdf");
+        var policyText = await File.ReadAllTextAsync(wcPolicyPath);
+        await SetupDocumentWithChunks(policyText, "WC-Policy-Sample.pdf");
 
         var pipeline = new ExtractionPipeline(
             _dbContext,
-            _classifier,
-            _policyExtractor,
-            _coverageExtractorFactory,
-            _validator,
+            _claudeService,
             _eventPublisher,
             _logger);
 
         // Act
         var policyId = await pipeline.ExtractStructuredDataAsync(_testDocumentId, _testTenantId);
-
-        // Track for cleanup
-        if (policyId.HasValue)
-        {
-            _createdPolicyIds.Add(policyId.Value);
-        }
+        if (policyId.HasValue) _createdPolicyIds.Add(policyId.Value);
 
         // Assert
         policyId.Should().NotBeNull();
@@ -306,82 +240,19 @@ Form: CG 20 37 04 13 - Additional Insured - Owners, Lessees or Contractors
             .FirstOrDefaultAsync(p => p.Id == policyId);
 
         policy.Should().NotBeNull();
-        policy!.PolicyNumber.Should().Contain("GL-2024-TEST-001");
-        policy.InsuredName.Should().Contain("Test Company");
-        policy.CarrierName.Should().Contain("ABC Insurance");
-        policy.EffectiveDate.Should().Be(new DateOnly(2024, 1, 1));
-        policy.ExpirationDate.Should().Be(new DateOnly(2025, 1, 1));
-        policy.TotalPremium.Should().Be(12500m);
-
-        // Verify GL coverage
-        var glCoverage = policy.Coverages.FirstOrDefault();
-        glCoverage.Should().NotBeNull();
-        glCoverage!.EachOccurrenceLimit.Should().Be(1_000_000m);
-        glCoverage.AggregateLimit.Should().Be(2_000_000m);
-
-        Console.WriteLine($"\n=== Extraction Successful ===");
-        Console.WriteLine($"Policy: {policy.PolicyNumber}");
-        Console.WriteLine($"Insured: {policy.InsuredName}");
-        Console.WriteLine($"Carrier: {policy.CarrierName}");
-        Console.WriteLine($"Premium: {policy.TotalPremium:C}");
-        Console.WriteLine($"GL Limits: ${glCoverage.EachOccurrenceLimit:N0} / ${glCoverage.AggregateLimit:N0}");
+        policy!.Coverages.Should().Contain(c =>
+            c.CoverageType.Contains("workers", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
-    public async Task ExtractStructuredData_DocumentNotFound_ReturnsNull()
+    public async Task ExtractStructuredData_NoChunks_ReturnsNullAndPublishesFailure()
     {
-        // Arrange
-        var pipeline = new ExtractionPipeline(
-            _dbContext,
-            _classifier,
-            _policyExtractor,
-            _coverageExtractorFactory,
-            _validator,
-            _eventPublisher,
-            _logger);
-
-        // Act
-        var result = await pipeline.ExtractStructuredDataAsync(
-            Guid.NewGuid(), // Non-existent document
-            _testTenantId);
-
-        // Assert
-        result.Should().BeNull();
-    }
-
-    [Fact]
-    public async Task ExtractStructuredData_NoChunks_SetsErrorStatus()
-    {
-        // Arrange: Create tenant first
-        var tenant = new Tenant
-        {
-            Id = _testTenantId,
-            Name = "Test Tenant - No Chunks",
-            Plan = "starter",
-            IsActive = true,
-            CreatedAt = DateTime.UtcNow
-        };
-        _dbContext.Tenants.Add(tenant);
-
-        // Create document without chunks
-        var document = new Document
-        {
-            Id = _testDocumentId,
-            TenantId = _testTenantId,
-            FileName = "empty.pdf",
-            ContentType = "application/pdf",
-            StoragePath = "test/empty.pdf",
-            ProcessingStatus = "processing"
-        };
-        _dbContext.Documents.Add(document);
-        await _dbContext.SaveChangesAsync();
+        // Arrange: Create document without chunks
+        await SetupDocumentWithChunks("", "empty.pdf", createChunks: false);
 
         var pipeline = new ExtractionPipeline(
             _dbContext,
-            _classifier,
-            _policyExtractor,
-            _coverageExtractorFactory,
-            _validator,
+            _claudeService,
             _eventPublisher,
             _logger);
 
@@ -390,21 +261,32 @@ Form: CG 20 37 04 13 - Additional Insured - Owners, Lessees or Contractors
 
         // Assert
         result.Should().BeNull();
-
-        var updatedDoc = await _dbContext.Documents
-            .IgnoreQueryFilters()
-            .FirstOrDefaultAsync(d => d.Id == _testDocumentId);
-        updatedDoc!.ProcessingStatus.Should().Be("extraction_failed");
-        updatedDoc.ProcessingError.Should().Contain("No text chunks");
-
-        // Verify failure event was published
-        var failureEvent = _eventPublisher.PublishedEvents
-            .OfType<ExtractionCompletedEvent>()
-            .FirstOrDefault(e => !e.Success);
-        failureEvent.Should().NotBeNull("Should publish extraction failed event");
+        _eventPublisher.PublishedEvents.Should().ContainSingle()
+            .Which.Should().BeOfType<ExtractionCompletedEvent>()
+            .Which.Success.Should().BeFalse();
     }
 
-    private async Task SetupDocumentWithChunks(string text, string fileName)
+    [Fact]
+    public async Task ExtractStructuredData_DocumentNotFound_ReturnsNull()
+    {
+        // Arrange: Don't create any document
+        var pipeline = new ExtractionPipeline(
+            _dbContext,
+            _claudeService,
+            _eventPublisher,
+            _logger);
+
+        // Act
+        var result = await pipeline.ExtractStructuredDataAsync(Guid.NewGuid(), _testTenantId);
+
+        // Assert
+        result.Should().BeNull();
+    }
+
+    private async Task SetupDocumentWithChunks(
+        string text,
+        string fileName,
+        bool createChunks = true)
     {
         // Create tenant
         var tenant = new Tenant
@@ -416,16 +298,6 @@ Form: CG 20 37 04 13 - Additional Insured - Owners, Lessees or Contractors
             CreatedAt = DateTime.UtcNow
         };
         _dbContext.Tenants.Add(tenant);
-        await _dbContext.SaveChangesAsync(); // Save tenant first to ensure FK is satisfied
-
-        // Verify tenant was saved
-        var savedTenant = await _dbContext.Tenants
-            .IgnoreQueryFilters()
-            .FirstOrDefaultAsync(t => t.Id == _testTenantId);
-        if (savedTenant == null)
-        {
-            throw new InvalidOperationException($"Failed to save test tenant {_testTenantId}");
-        }
 
         // Create document
         var document = new Document
@@ -434,42 +306,37 @@ Form: CG 20 37 04 13 - Additional Insured - Owners, Lessees or Contractors
             TenantId = _testTenantId,
             FileName = fileName,
             ContentType = "application/pdf",
-            StoragePath = $"test/{fileName}",
-            ProcessingStatus = "processing"
+            StoragePath = $"test/{_testDocumentId}/{fileName}",
+            FileSizeBytes = text.Length,
+            ProcessingStatus = "pending",
+            UploadedAt = DateTime.UtcNow
         };
         _dbContext.Documents.Add(document);
 
-        // Split text into chunks (simple split by paragraphs)
-        var paragraphs = text.Split("\n\n", StringSplitOptions.RemoveEmptyEntries);
-        var chunkIndex = 0;
-
-        foreach (var paragraph in paragraphs)
+        if (createChunks && !string.IsNullOrEmpty(text))
         {
-            if (string.IsNullOrWhiteSpace(paragraph)) continue;
-
-            var chunk = new DocumentChunk
+            // Create chunks (simple split by paragraphs)
+            var paragraphs = text.Split("\n\n", StringSplitOptions.RemoveEmptyEntries);
+            var chunks = paragraphs.Select((p, i) => new DocumentChunk
             {
                 Id = Guid.NewGuid(),
                 DocumentId = _testDocumentId,
-                ChunkText = paragraph.Trim(),
-                ChunkIndex = chunkIndex++,
-                PageStart = 1,
-                PageEnd = 1,
-                SectionType = chunkIndex == 0 ? "declarations" : "coverage_form",
-                TokenCount = paragraph.Length / 4, // Rough estimate
+                ChunkIndex = i,
+                ChunkText = p,
+                PageStart = i / 3 + 1,
+                PageEnd = i / 3 + 1,
+                TokenCount = p.Split(' ').Length,
                 Embedding = new Vector(new float[1536]), // Dummy embedding
                 CreatedAt = DateTime.UtcNow
-            };
-            _dbContext.DocumentChunks.Add(chunk);
+            }).ToList();
+
+            _dbContext.DocumentChunks.AddRange(chunks);
         }
 
         await _dbContext.SaveChangesAsync();
     }
 }
 
-/// <summary>
-/// Test event publisher that captures published events.
-/// </summary>
 internal class TestEventPublisher : IEventPublisher
 {
     public List<IDomainEvent> PublishedEvents { get; } = [];

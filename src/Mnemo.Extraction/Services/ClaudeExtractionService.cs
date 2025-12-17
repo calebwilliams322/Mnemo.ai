@@ -5,6 +5,8 @@ using Anthropic.SDK.Messaging;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mnemo.Extraction.Interfaces;
+using Mnemo.Extraction.Models;
+using Mnemo.Extraction.Prompts;
 
 namespace Mnemo.Extraction.Services;
 
@@ -57,6 +59,202 @@ public class ClaudeExtractionService : IClaudeExtractionService
         _client = new AnthropicClient(settings.Value.ApiKey);
         _logger.LogInformation(
             "Claude Extraction Service initialized with model: {Model}", _model);
+    }
+
+    /// <summary>
+    /// Extract policy data from document text (from old_src).
+    /// This is the main extraction method matching old_src exactly.
+    /// </summary>
+    public async Task<ExtractionResponse> ExtractPolicyDataAsync(
+        ExtractionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var prompt = BuildExtractionPrompt(request.PdfText);
+
+            var parameters = new MessageParameters
+            {
+                Model = _model,
+                MaxTokens = _maxTokens,
+                Messages = new List<Message>
+                {
+                    new Message(RoleType.User, prompt)
+                }
+            };
+
+            var response = await _client.Messages.GetClaudeMessageAsync(parameters, cancellationToken);
+            var textContent = response.Content.OfType<TextContent>().FirstOrDefault();
+            var responseText = textContent?.Text ?? "";
+
+            var result = ParseExtractionResponse(responseText);
+            return new ExtractionResponse(true, result, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Policy extraction failed for document {DocumentId}", request.DocumentId);
+            return new ExtractionResponse(false, null, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Build extraction prompt (from old_src).
+    /// </summary>
+    private static string BuildExtractionPrompt(string pdfText)
+    {
+        return $$"""
+            You are an expert insurance document analyzer. Extract structured data from the following insurance policy document text.
+
+            <document>
+            {{pdfText}}
+            </document>
+
+            Extract the following information and return it as valid JSON:
+
+            {
+                "policyNumber": "string or null",
+                "carrierName": "string or null",
+                "documentType": "Policy|Quote|Binder|Endorsement|Certificate|Other or null",
+                "effectiveDate": "YYYY-MM-DD or null",
+                "expirationDate": "YYYY-MM-DD or null",
+                "namedInsured": "string or null",
+                "insuredAddress": "string or null",
+                "totalPremium": number or null,
+                "coverages": [
+                    {
+                        "coverageType": "GeneralLiability|ProfessionalLiability|CommercialProperty|BusinessAuto|WorkersCompensation|UmbrellaExcess|CyberLiability|DirectorsOfficers|EmploymentPractices|ProductLiability|InlandMarine|BusinessOwners|Other",
+                        "coverageDescription": "string",
+                        "limitPerOccurrence": number or null,
+                        "limitAggregate": number or null,
+                        "deductible": number or null,
+                        "premium": number or null,
+                        "additionalDetails": "string or null"
+                    }
+                ],
+                "additionalFields": {
+                    "key": "value"
+                },
+                "confidenceScore": 0.0 to 1.0,
+                "extractionNotes": "string describing any issues or uncertainties"
+            }
+
+            Important:
+            - Extract ALL coverages found in the document
+            - For monetary values, use numbers without currency symbols or commas
+            - Set confidenceScore based on how complete and clear the document was
+            - Include any relevant additional fields not covered above
+            - If a field cannot be determined, use null
+
+            Return ONLY the JSON object, no additional text.
+            """;
+    }
+
+    /// <summary>
+    /// Parse extraction response (from old_src).
+    /// </summary>
+    private PolicyExtractionResult ParseExtractionResponse(string responseText)
+    {
+        // Clean up the response - remove markdown code blocks if present
+        var jsonText = responseText.Trim();
+        if (jsonText.StartsWith("```json"))
+            jsonText = jsonText[7..];
+        if (jsonText.StartsWith("```"))
+            jsonText = jsonText[3..];
+        if (jsonText.EndsWith("```"))
+            jsonText = jsonText[..^3];
+        jsonText = jsonText.Trim();
+
+        using var doc = JsonDocument.Parse(jsonText);
+        var root = doc.RootElement;
+
+        var coverages = new List<CoverageExtractionResult>();
+        if (root.TryGetProperty("coverages", out var coveragesElement))
+        {
+            foreach (var coverage in coveragesElement.EnumerateArray())
+            {
+                coverages.Add(new CoverageExtractionResult(
+                    ParseCoverageType(coverage.GetProperty("coverageType").GetString()),
+                    coverage.TryGetProperty("coverageDescription", out var desc) ? desc.GetString() ?? "" : "",
+                    GetNullableDecimalOld(coverage, "limitPerOccurrence"),
+                    GetNullableDecimalOld(coverage, "limitAggregate"),
+                    GetNullableDecimalOld(coverage, "deductible"),
+                    GetNullableDecimalOld(coverage, "premium"),
+                    GetNullableStringOld(coverage, "additionalDetails")
+                ));
+            }
+        }
+
+        var additionalFields = new Dictionary<string, string>();
+        if (root.TryGetProperty("additionalFields", out var additionalElement))
+        {
+            foreach (var prop in additionalElement.EnumerateObject())
+            {
+                additionalFields[prop.Name] = prop.Value.ToString();
+            }
+        }
+
+        return new PolicyExtractionResult(
+            GetNullableStringOld(root, "policyNumber"),
+            GetNullableStringOld(root, "carrierName"),
+            GetNullableStringOld(root, "documentType"),
+            GetNullableDateTimeOld(root, "effectiveDate"),
+            GetNullableDateTimeOld(root, "expirationDate"),
+            GetNullableStringOld(root, "namedInsured"),
+            GetNullableStringOld(root, "insuredAddress"),
+            GetNullableDecimalOld(root, "totalPremium"),
+            coverages,
+            additionalFields,
+            root.TryGetProperty("confidenceScore", out var confidence) ? confidence.GetDouble() : 0.5,
+            GetNullableStringOld(root, "extractionNotes")
+        );
+    }
+
+    /// <summary>
+    /// Parse coverage type string to normalized format (from old_src).
+    /// </summary>
+    private static string ParseCoverageType(string? value)
+    {
+        return value switch
+        {
+            "GeneralLiability" => "general_liability",
+            "ProfessionalLiability" => "professional_liability",
+            "CommercialProperty" or "PropertyDamage" => "commercial_property",
+            "BusinessAuto" or "AutoLiability" => "business_auto",
+            "WorkersCompensation" => "workers_compensation",
+            "UmbrellaExcess" => "umbrella_excess",
+            "CyberLiability" => "cyber_liability",
+            "DirectorsOfficers" => "directors_officers",
+            "EmploymentPractices" => "employment_practices",
+            "ProductLiability" => "product_liability",
+            "InlandMarine" => "inland_marine",
+            "BusinessOwners" => "business_owners",
+            _ => "other"
+        };
+    }
+
+    private static string? GetNullableStringOld(JsonElement element, string propertyName)
+    {
+        if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind != JsonValueKind.Null)
+            return prop.GetString();
+        return null;
+    }
+
+    private static decimal? GetNullableDecimalOld(JsonElement element, string propertyName)
+    {
+        if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.Number)
+            return prop.GetDecimal();
+        return null;
+    }
+
+    private static DateTime? GetNullableDateTimeOld(JsonElement element, string propertyName)
+    {
+        if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.String)
+        {
+            var str = prop.GetString();
+            if (DateTime.TryParse(str, out var dt))
+                return dt;
+        }
+        return null;
     }
 
     public async Task<ClaudeExtractionResult<T>> ExtractAsync<T>(
@@ -117,6 +315,216 @@ public class ClaudeExtractionService : IClaudeExtractionService
         CancellationToken ct = default)
     {
         return await GetCompletionWithRetryAsync(systemPrompt, userContent, ct);
+    }
+
+    /// <summary>
+    /// Extract all policy and coverage data in a single Claude call.
+    /// This is the proven approach from the old system.
+    /// </summary>
+    public async Task<UnifiedExtractionResult> ExtractAllAsync(
+        string fullText,
+        CancellationToken ct = default)
+    {
+        _logger.LogInformation("Starting unified extraction for document ({TextLength} chars)", fullText.Length);
+
+        try
+        {
+            var prompt = UnifiedExtractionPrompt.Format(fullText);
+            var rawOutput = await GetCompletionWithRetryAsync(
+                "You are an expert insurance document analyzer. Return only valid JSON.",
+                prompt,
+                ct);
+
+            if (string.IsNullOrWhiteSpace(rawOutput))
+            {
+                _logger.LogWarning("Empty response from Claude for unified extraction");
+                return new UnifiedExtractionResult
+                {
+                    Success = false,
+                    Error = "Empty response from Claude",
+                    RawJson = rawOutput
+                };
+            }
+
+            var result = ParseUnifiedResponse(rawOutput);
+            result = result with { RawJson = rawOutput };
+
+            _logger.LogInformation(
+                "Unified extraction complete: {PolicyNumber}, {CoverageCount} coverages, confidence {Confidence:P0}",
+                result.PolicyNumber ?? "unknown",
+                result.Coverages.Count,
+                result.Confidence);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unified extraction failed");
+            return new UnifiedExtractionResult
+            {
+                Success = false,
+                Error = ex.Message
+            };
+        }
+    }
+
+    /// <summary>
+    /// Parse the unified extraction response from Claude.
+    /// </summary>
+    private UnifiedExtractionResult ParseUnifiedResponse(string rawOutput)
+    {
+        var json = ExtractJsonFromResponse(rawOutput);
+
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        // Parse policy-level fields
+        var result = new UnifiedExtractionResult
+        {
+            Success = true,
+            PolicyNumber = GetStringOrNull(root, "policyNumber"),
+            QuoteNumber = GetStringOrNull(root, "quoteNumber"),
+            CarrierName = GetStringOrNull(root, "carrierName"),
+            CarrierNaic = GetStringOrNull(root, "carrierNaic"),
+            DocumentType = GetStringOrNull(root, "documentType"),
+            EffectiveDate = GetDateOrNull(root, "effectiveDate"),
+            ExpirationDate = GetDateOrNull(root, "expirationDate"),
+            InsuredName = GetStringOrNull(root, "namedInsured"),
+            InsuredAddress = ParseAddress(root),
+            TotalPremium = GetDecimalOrNull(root, "totalPremium"),
+            PolicyStatus = DeterminePolicyStatus(GetStringOrNull(root, "documentType")),
+            Confidence = GetDecimalOrNull(root, "confidenceScore") ?? 0.5m,
+            Notes = GetStringOrNull(root, "extractionNotes"),
+            Coverages = ParseCoverages(root)
+        };
+
+        return result;
+    }
+
+    private static InsuredAddressInfo? ParseAddress(JsonElement root)
+    {
+        if (!root.TryGetProperty("insuredAddress", out var addr) ||
+            addr.ValueKind != JsonValueKind.Object)
+            return null;
+
+        return new InsuredAddressInfo
+        {
+            Line1 = GetStringOrNull(addr, "line1"),
+            Line2 = GetStringOrNull(addr, "line2"),
+            City = GetStringOrNull(addr, "city"),
+            State = GetStringOrNull(addr, "state"),
+            Zip = GetStringOrNull(addr, "zip")
+        };
+    }
+
+    private static List<UnifiedCoverageResult> ParseCoverages(JsonElement root)
+    {
+        var coverages = new List<UnifiedCoverageResult>();
+
+        if (!root.TryGetProperty("coverages", out var coveragesElement) ||
+            coveragesElement.ValueKind != JsonValueKind.Array)
+            return coverages;
+
+        foreach (var cov in coveragesElement.EnumerateArray())
+        {
+            var coverageType = GetStringOrNull(cov, "coverageType") ?? "other";
+
+            // Normalize coverage type to snake_case
+            coverageType = NormalizeCoverageType(coverageType);
+
+            coverages.Add(new UnifiedCoverageResult
+            {
+                CoverageType = coverageType,
+                CoverageDescription = GetStringOrNull(cov, "coverageDescription"),
+                EachOccurrenceLimit = GetDecimalOrNull(cov, "eachOccurrenceLimit") ??
+                                      GetDecimalOrNull(cov, "limitPerOccurrence"),
+                AggregateLimit = GetDecimalOrNull(cov, "aggregateLimit") ??
+                                 GetDecimalOrNull(cov, "limitAggregate"),
+                Deductible = GetDecimalOrNull(cov, "deductible"),
+                Premium = GetDecimalOrNull(cov, "premium"),
+                IsOccurrenceForm = GetBoolOrNull(cov, "isOccurrenceForm"),
+                IsClaimsMade = GetBoolOrNull(cov, "isClaimsMade"),
+                RetroactiveDate = GetDateOrNull(cov, "retroactiveDate"),
+                AdditionalDetails = GetStringOrNull(cov, "additionalDetails")
+            });
+        }
+
+        return coverages;
+    }
+
+    private static string NormalizeCoverageType(string coverageType)
+    {
+        // Handle both camelCase and PascalCase variants
+        return coverageType.ToLowerInvariant() switch
+        {
+            "generalliability" or "general_liability" => "general_liability",
+            "commercialproperty" or "commercial_property" => "commercial_property",
+            "businessauto" or "business_auto" => "business_auto",
+            "workerscompensation" or "workers_compensation" => "workers_compensation",
+            "umbrellaexcess" or "umbrella_excess" => "umbrella_excess",
+            "professionalliability" or "professional_liability" => "professional_liability",
+            "cyberliability" or "cyber_liability" => "cyber_liability",
+            "directorsofficers" or "directors_officers" => "directors_officers",
+            "employmentpractices" or "employment_practices" => "employment_practices",
+            "productliability" or "product_liability" => "product_liability",
+            "inlandmarine" or "inland_marine" => "inland_marine",
+            "businessowners" or "business_owners" => "business_owners",
+            _ => coverageType.ToLowerInvariant()
+        };
+    }
+
+    private static string DeterminePolicyStatus(string? documentType)
+    {
+        return documentType?.ToLowerInvariant() switch
+        {
+            "policy" => "active",
+            "binder" => "bound",
+            "quote" => "quote",
+            _ => "quote"
+        };
+    }
+
+    private static string? GetStringOrNull(JsonElement element, string propertyName)
+    {
+        if (element.TryGetProperty(propertyName, out var prop) &&
+            prop.ValueKind == JsonValueKind.String)
+        {
+            return prop.GetString();
+        }
+        return null;
+    }
+
+    private static decimal? GetDecimalOrNull(JsonElement element, string propertyName)
+    {
+        if (element.TryGetProperty(propertyName, out var prop))
+        {
+            if (prop.ValueKind == JsonValueKind.Number)
+                return prop.GetDecimal();
+            if (prop.ValueKind == JsonValueKind.String &&
+                decimal.TryParse(prop.GetString(), out var val))
+                return val;
+        }
+        return null;
+    }
+
+    private static bool? GetBoolOrNull(JsonElement element, string propertyName)
+    {
+        if (element.TryGetProperty(propertyName, out var prop))
+        {
+            if (prop.ValueKind == JsonValueKind.True)
+                return true;
+            if (prop.ValueKind == JsonValueKind.False)
+                return false;
+        }
+        return null;
+    }
+
+    private static DateOnly? GetDateOrNull(JsonElement element, string propertyName)
+    {
+        var str = GetStringOrNull(element, propertyName);
+        if (str != null && DateOnly.TryParse(str, out var date))
+            return date;
+        return null;
     }
 
     private async Task<string> GetCompletionWithRetryAsync(

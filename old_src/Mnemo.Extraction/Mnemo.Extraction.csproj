@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Mnemo.Domain\Mnemo.Domain.csproj" />
+    <ProjectReference Include="..\Mnemo.Application\Mnemo.Application.csproj" />
+    <ProjectReference Include="..\Mnemo.Infrastructure\Mnemo.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Anthropic.SDK" Version="5.8.0" />
+    <PackageReference Include="OpenAI" Version="2.1.0" />
+    <PackageReference Include="PdfPig" Version="0.1.12" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

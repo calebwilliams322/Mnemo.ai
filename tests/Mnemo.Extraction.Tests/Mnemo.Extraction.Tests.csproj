@@ -31,4 +31,8 @@
     <ProjectReference Include="..\..\src\Mnemo.Infrastructure\Mnemo.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

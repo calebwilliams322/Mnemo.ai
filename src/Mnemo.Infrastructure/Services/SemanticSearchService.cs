@@ -1,9 +1,9 @@
+using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Mnemo.Application.Services;
 using Mnemo.Infrastructure.Persistence;
 using Npgsql;
-using Pgvector;
 
 namespace Mnemo.Infrastructure.Services;
 
@@ -48,9 +48,16 @@ public class SemanticSearchService : ISemanticSearchService
         {
             await using var cmd = new NpgsqlCommand(sql, connection);
 
-            // Add parameters
-            var queryVector = new Vector(request.QueryEmbedding);
-            cmd.Parameters.AddWithValue("@queryEmbedding", queryVector);
+            // Add parameters - convert vector to string format for pgvector
+            // Format: '[0.1,0.2,0.3,...]' - use InvariantCulture to ensure consistent decimal separator
+            var vectorString = "[" + string.Join(",", request.QueryEmbedding.Select(f => f.ToString(CultureInfo.InvariantCulture))) + "]";
+
+            _logger.LogDebug("Query vector (first 100 chars): {VectorPrefix}...",
+                vectorString.Length > 100 ? vectorString[..100] : vectorString);
+            _logger.LogDebug("Query vector length: {Length}, dimensions: {Dims}",
+                vectorString.Length, request.QueryEmbedding.Length);
+
+            cmd.Parameters.AddWithValue("@queryEmbedding", vectorString);
             cmd.Parameters.AddWithValue("@tenantId", request.TenantId);
             cmd.Parameters.AddWithValue("@minSimilarity", request.MinSimilarity);
             cmd.Parameters.AddWithValue("@topK", request.TopK);
@@ -108,11 +115,12 @@ public class SemanticSearchService : ISemanticSearchService
         var hasPolicyFilter = request.PolicyIds?.Count > 0;
 
         // Build WHERE clause conditions
+        // Cast @queryEmbedding to vector type for pgvector comparison
         var conditions = new List<string>
         {
             "d.tenant_id = @tenantId",
             "dc.embedding IS NOT NULL",
-            "1 - (dc.embedding <=> @queryEmbedding) >= @minSimilarity"
+            "1 - (dc.embedding <=> @queryEmbedding::vector) >= @minSimilarity"
         };
 
         if (hasDocumentFilter)
@@ -141,11 +149,11 @@ public class SemanticSearchService : ISemanticSearchService
                 dc.page_start,
                 dc.page_end,
                 dc.section_type,
-                1 - (dc.embedding <=> @queryEmbedding) as similarity
+                1 - (dc.embedding <=> @queryEmbedding::vector) as similarity
             FROM document_chunks dc
             INNER JOIN documents d ON dc.document_id = d.id
             WHERE {whereClause}
-            ORDER BY dc.embedding <=> @queryEmbedding
+            ORDER BY dc.embedding <=> @queryEmbedding::vector
             LIMIT @topK
         ";
     }

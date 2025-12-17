@@ -1,12 +1,15 @@
 using System.Net.Http.Json;
 using System.Text;
 using System.Threading.RateLimiting;
+using Hangfire;
+using Hangfire.PostgreSql;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Mnemo.Api.Authorization;
+using Mnemo.Api.Hubs;
 using Mnemo.Api.Services;
 using Mnemo.Application.Configuration;
 using Mnemo.Application.DTOs;
@@ -15,6 +18,8 @@ using Mnemo.Domain.Entities;
 using Mnemo.Domain.Enums;
 using Mnemo.Infrastructure.Persistence;
 using Mnemo.Infrastructure.Services;
+using Mnemo.Api.EventHandlers;
+using Mnemo.Domain.Events;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -53,6 +58,43 @@ builder.Services.AddScoped<ISupabaseAuthService, SupabaseAuthService>();
 
 // Register Audit service
 builder.Services.AddScoped<IAuditService, AuditService>();
+
+// Register Storage service (Supabase Storage)
+builder.Services.AddScoped<IStorageService, SupabaseStorageService>();
+
+// Register Event Publisher and Background Job Service
+builder.Services.AddScoped<IEventPublisher, EventPublisher>();
+builder.Services.AddScoped<IBackgroundJobService, HangfireJobService>();
+
+// Register Document Processing Service (called by Hangfire jobs)
+builder.Services.AddScoped<IDocumentProcessingService, DocumentProcessingService>();
+
+// Configure Hangfire with PostgreSQL storage (NOT in-memory)
+var connectionString = builder.Configuration.GetValue<string>("Database:ConnectionString");
+builder.Services.AddHangfire(config => config
+    .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
+    .UseSimpleAssemblyNameTypeSerializer()
+    .UseRecommendedSerializerSettings()
+    .UsePostgreSqlStorage(options => options.UseNpgsqlConnection(connectionString)));
+
+// Add Hangfire server with 2 worker threads for parallel processing
+builder.Services.AddHangfireServer(options =>
+{
+    options.WorkerCount = 2;
+    options.Queues = new[] { "default", "extraction" };
+});
+
+// Configure SignalR for real-time notifications
+builder.Services.AddSignalR();
+
+// Register SignalR notification service
+builder.Services.AddScoped<INotificationService, SignalRNotificationService>();
+
+// Register document event handlers (Phase 4 webhooks will also subscribe to these events)
+builder.Services.AddScoped<IEventHandler<DocumentUploadedEvent>, DocumentUploadedEventHandler>();
+builder.Services.AddScoped<IEventHandler<DocumentProcessingStartedEvent>, DocumentProcessingStartedEventHandler>();
+builder.Services.AddScoped<IEventHandler<DocumentProgressEvent>, DocumentProgressEventHandler>();
+builder.Services.AddScoped<IEventHandler<DocumentProcessedEvent>, DocumentProcessedEventHandler>();
 
 // Configure JWT Authentication with Supabase
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -153,6 +195,9 @@ app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
+
+// Map SignalR hub for real-time notifications
+app.MapHub<NotificationHub>("/hubs/notifications");
 
 // Health check endpoint
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }))
@@ -643,6 +688,367 @@ app.MapPatch("/tenant/users/{userId:guid}/reactivate", async (
 .RequireAuthorization(AuthorizationPolicies.RequireAdmin)
 .WithName("ReactivateUser")
 .WithTags("Users")
+.RequireRateLimiting("api");
+
+// ==================== Document Endpoints ====================
+
+// POST /documents/upload - Upload a single document
+app.MapPost("/documents/upload", async (
+    IFormFile file,
+    ICurrentUserService currentUser,
+    IStorageService storageService,
+    IBackgroundJobService jobService,
+    IEventPublisher eventPublisher,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue || !currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    // Validate file
+    if (file == null || file.Length == 0)
+        return Results.BadRequest("No file provided");
+
+    // Only accept PDFs for now
+    if (!file.ContentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) &&
+        !file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest("Only PDF files are accepted");
+    }
+
+    var documentId = Guid.NewGuid();
+    var tenantId = currentUser.TenantId.Value;
+
+    try
+    {
+        // Upload to Supabase Storage
+        await using var stream = file.OpenReadStream();
+        var storagePath = await storageService.UploadAsync(
+            tenantId,
+            documentId,
+            file.FileName,
+            stream,
+            file.ContentType);
+
+        // Create document record
+        var document = new Document
+        {
+            Id = documentId,
+            TenantId = tenantId,
+            FileName = file.FileName,
+            StoragePath = storagePath,
+            FileSizeBytes = file.Length,
+            ContentType = file.ContentType,
+            ProcessingStatus = "pending",
+            UploadedByUserId = currentUser.UserId,
+            UploadedAt = DateTime.UtcNow
+        };
+
+        db.Documents.Add(document);
+        await db.SaveChangesAsync();
+
+        // Publish upload event for SignalR notification
+        await eventPublisher.PublishAsync(new DocumentUploadedEvent
+        {
+            DocumentId = documentId,
+            TenantId = tenantId,
+            FileName = file.FileName,
+            StoragePath = storagePath
+        });
+
+        // Queue background job for processing
+        jobService.Enqueue<IDocumentProcessingService>(
+            svc => svc.ProcessDocumentAsync(documentId, tenantId));
+
+        logger.LogInformation(
+            "Document uploaded: {DocumentId} ({FileName}) by user {UserId}",
+            documentId, file.FileName, currentUser.UserId);
+
+        return Results.Created($"/documents/{documentId}", new DocumentUploadResponse(
+            documentId,
+            file.FileName,
+            "pending",
+            document.UploadedAt));
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to upload document: {FileName}", file.FileName);
+        return Results.Problem("Failed to upload document");
+    }
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("UploadDocument")
+.WithTags("Documents")
+.RequireRateLimiting("api")
+.DisableAntiforgery(); // Required for file uploads
+
+// POST /documents/upload/batch - Upload multiple documents at once
+app.MapPost("/documents/upload/batch", async (
+    IFormFileCollection files,
+    ICurrentUserService currentUser,
+    IStorageService storageService,
+    IBackgroundJobService jobService,
+    IEventPublisher eventPublisher,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue || !currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    if (files == null || files.Count == 0)
+        return Results.BadRequest("No files provided");
+
+    // Limit batch size
+    const int maxBatchSize = 5;
+    if (files.Count > maxBatchSize)
+        return Results.BadRequest($"Maximum {maxBatchSize} files per batch");
+
+    var tenantId = currentUser.TenantId.Value;
+    var uploadedDocs = new List<DocumentUploadResponse>();
+    var errors = new List<string>();
+
+    foreach (var file in files)
+    {
+        // Skip non-PDF files
+        if (!file.ContentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) &&
+            !file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            errors.Add($"Skipped '{file.FileName}': Only PDF files are accepted");
+            continue;
+        }
+
+        var documentId = Guid.NewGuid();
+
+        try
+        {
+            await using var stream = file.OpenReadStream();
+            var storagePath = await storageService.UploadAsync(
+                tenantId,
+                documentId,
+                file.FileName,
+                stream,
+                file.ContentType);
+
+            var document = new Document
+            {
+                Id = documentId,
+                TenantId = tenantId,
+                FileName = file.FileName,
+                StoragePath = storagePath,
+                FileSizeBytes = file.Length,
+                ContentType = file.ContentType,
+                ProcessingStatus = "pending",
+                UploadedByUserId = currentUser.UserId,
+                UploadedAt = DateTime.UtcNow
+            };
+
+            db.Documents.Add(document);
+            await db.SaveChangesAsync();
+
+            // Publish upload event
+            await eventPublisher.PublishAsync(new DocumentUploadedEvent
+            {
+                DocumentId = documentId,
+                TenantId = tenantId,
+                FileName = file.FileName,
+                StoragePath = storagePath
+            });
+
+            // Queue processing job
+            jobService.Enqueue<IDocumentProcessingService>(
+                svc => svc.ProcessDocumentAsync(documentId, tenantId));
+
+            uploadedDocs.Add(new DocumentUploadResponse(
+                documentId,
+                file.FileName,
+                "pending",
+                document.UploadedAt));
+
+            logger.LogInformation(
+                "Document uploaded (batch): {DocumentId} ({FileName})",
+                documentId, file.FileName);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to upload document in batch: {FileName}", file.FileName);
+            errors.Add($"Failed to upload '{file.FileName}': {ex.Message}");
+        }
+    }
+
+    if (uploadedDocs.Count == 0 && errors.Count > 0)
+        return Results.BadRequest(new { errors });
+
+    return Results.Ok(new BatchUploadResponse(
+        uploadedDocs.Count,
+        uploadedDocs));
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("BatchUploadDocuments")
+.WithTags("Documents")
+.RequireRateLimiting("api")
+.DisableAntiforgery();
+
+// GET /documents - List documents for current tenant
+app.MapGet("/documents", async (
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    int page = 1,
+    int pageSize = 20,
+    string? status = null) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var query = db.Documents
+        .Where(d => d.TenantId == currentUser.TenantId.Value)
+        .AsQueryable();
+
+    if (!string.IsNullOrEmpty(status))
+        query = query.Where(d => d.ProcessingStatus == status);
+
+    var totalCount = await query.CountAsync();
+
+    var documents = await query
+        .OrderByDescending(d => d.UploadedAt)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .Select(d => new DocumentSummaryDto(
+            d.Id,
+            d.FileName,
+            d.ProcessingStatus,
+            d.DocumentType,
+            d.UploadedAt))
+        .ToListAsync();
+
+    return Results.Ok(new
+    {
+        data = documents,
+        pagination = new
+        {
+            page,
+            pageSize,
+            totalCount,
+            totalPages = (int)Math.Ceiling(totalCount / (double)pageSize)
+        }
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("ListDocuments")
+.WithTags("Documents")
+.RequireRateLimiting("api");
+
+// GET /documents/{id} - Get document details
+app.MapGet("/documents/{id:guid}", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    MnemoDbContext db) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var document = await db.Documents
+        .Where(d => d.Id == id && d.TenantId == currentUser.TenantId.Value)
+        .Select(d => new DocumentDto(
+            d.Id,
+            d.FileName,
+            d.ContentType,
+            d.FileSizeBytes,
+            d.PageCount,
+            d.DocumentType,
+            d.ProcessingStatus,
+            d.ProcessingError,
+            d.ProcessedAt,
+            d.UploadedAt,
+            d.UploadedByUserId,
+            d.SubmissionGroupId))
+        .FirstOrDefaultAsync();
+
+    if (document == null)
+        return Results.NotFound("Document not found");
+
+    return Results.Ok(document);
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetDocument")
+.WithTags("Documents")
+.RequireRateLimiting("api");
+
+// GET /documents/{id}/download - Get signed URL for document download
+app.MapGet("/documents/{id:guid}/download", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    IStorageService storageService,
+    MnemoDbContext db) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var document = await db.Documents
+        .Where(d => d.Id == id && d.TenantId == currentUser.TenantId.Value)
+        .FirstOrDefaultAsync();
+
+    if (document == null)
+        return Results.NotFound("Document not found");
+
+    // Generate signed URL valid for 1 hour
+    var signedUrl = await storageService.GetSignedUrlAsync(
+        document.StoragePath,
+        TimeSpan.FromHours(1));
+
+    return Results.Ok(new
+    {
+        downloadUrl = signedUrl,
+        fileName = document.FileName,
+        expiresIn = "1 hour"
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetDocumentDownloadUrl")
+.WithTags("Documents")
+.RequireRateLimiting("api");
+
+// DELETE /documents/{id} - Delete a document
+app.MapDelete("/documents/{id:guid}", async (
+    Guid id,
+    ICurrentUserService currentUser,
+    IStorageService storageService,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var document = await db.Documents
+        .Where(d => d.Id == id && d.TenantId == currentUser.TenantId.Value)
+        .FirstOrDefaultAsync();
+
+    if (document == null)
+        return Results.NotFound("Document not found");
+
+    try
+    {
+        // Delete from storage
+        await storageService.DeleteAsync(document.StoragePath);
+
+        // Delete from database
+        db.Documents.Remove(document);
+        await db.SaveChangesAsync();
+
+        logger.LogInformation(
+            "Document deleted: {DocumentId} by user {UserId}",
+            id, currentUser.UserId);
+
+        return Results.NoContent();
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to delete document: {DocumentId}", id);
+        return Results.Problem("Failed to delete document");
+    }
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("DeleteDocument")
+.WithTags("Documents")
 .RequireRateLimiting("api");
 
 app.Run();

@@ -1,0 +1,381 @@
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Mnemo.Application.Services;
+using Mnemo.Domain.Entities;
+using Mnemo.Extraction.Interfaces;
+using Mnemo.Extraction.Prompts;
+using Mnemo.Infrastructure.Persistence;
+
+namespace Mnemo.Infrastructure.Services;
+
+/// <summary>
+/// Configuration for chat service.
+/// </summary>
+public class ChatSettings
+{
+    public int MaxContextChunks { get; set; } = 10;
+    public double MinSimilarity { get; set; } = 0.7;
+    public int MaxHistoryMessages { get; set; } = 10;
+    public int MaxResponseTokens { get; set; } = 2048;
+}
+
+/// <summary>
+/// RAG-powered chat service for insurance policy Q&A.
+/// </summary>
+public partial class ChatService : IChatService
+{
+    private readonly MnemoDbContext _dbContext;
+    private readonly ICurrentUserService _currentUser;
+    private readonly ISemanticSearchService _semanticSearch;
+    private readonly IEmbeddingService _embeddingService;
+    private readonly IClaudeChatService _claudeChat;
+    private readonly ILogger<ChatService> _logger;
+    private readonly ChatSettings _settings;
+
+    public ChatService(
+        MnemoDbContext dbContext,
+        ICurrentUserService currentUser,
+        ISemanticSearchService semanticSearch,
+        IEmbeddingService embeddingService,
+        IClaudeChatService claudeChat,
+        IOptions<ChatSettings> settings,
+        ILogger<ChatService> logger)
+    {
+        _dbContext = dbContext;
+        _currentUser = currentUser;
+        _semanticSearch = semanticSearch;
+        _embeddingService = embeddingService;
+        _claudeChat = claudeChat;
+        _settings = settings.Value;
+        _logger = logger;
+    }
+
+    public async IAsyncEnumerable<ChatStreamResult> SendMessageAsync(
+        Guid conversationId,
+        string userMessage,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        _logger.LogInformation(
+            "Processing chat message for conversation {ConversationId}",
+            conversationId);
+
+        // 1. Load conversation with context
+        var conversation = await _dbContext.Conversations
+            .Include(c => c.Messages.OrderBy(m => m.CreatedAt))
+            .FirstOrDefaultAsync(c => c.Id == conversationId, ct);
+
+        if (conversation == null)
+        {
+            yield return new ChatStreamResult
+            {
+                Type = "error",
+                Error = "Conversation not found"
+            };
+            yield break;
+        }
+
+        // 2. Save user message
+        var userMsg = new Message
+        {
+            Id = Guid.NewGuid(),
+            ConversationId = conversationId,
+            Role = "user",
+            Content = userMessage,
+            CitedChunkIds = "[]",
+            CreatedAt = DateTime.UtcNow
+        };
+        _dbContext.Messages.Add(userMsg);
+        await _dbContext.SaveChangesAsync(ct);
+
+        // 3. Embed user query
+        var embeddingResult = await _embeddingService.GenerateEmbeddingAsync(userMessage);
+        if (!embeddingResult.Success || embeddingResult.Embeddings.Count == 0)
+        {
+            yield return new ChatStreamResult
+            {
+                Type = "error",
+                Error = "Failed to generate query embedding"
+            };
+            yield break;
+        }
+
+        // 4. Semantic search for relevant chunks
+        var policyIds = ParseGuidArray(conversation.PolicyIds);
+        var documentIds = ParseGuidArray(conversation.DocumentIds);
+
+        var searchRequest = new SemanticSearchRequest
+        {
+            QueryEmbedding = embeddingResult.Embeddings[0],
+            TenantId = _currentUser.TenantId!.Value,
+            PolicyIds = policyIds.Count > 0 ? policyIds : null,
+            DocumentIds = documentIds.Count > 0 ? documentIds : null,
+            TopK = _settings.MaxContextChunks,
+            MinSimilarity = _settings.MinSimilarity
+        };
+
+        var relevantChunks = await _semanticSearch.SearchAsync(searchRequest, ct);
+
+        _logger.LogInformation(
+            "Found {ChunkCount} relevant chunks for query",
+            relevantChunks.Count);
+
+        // 5. Build RAG prompt
+        var recentMessages = conversation.Messages
+            .TakeLast(_settings.MaxHistoryMessages)
+            .Select(m => (m.Role, m.Content))
+            .ToList();
+
+        var contextPrompt = ChatPrompts.BuildUserMessage(
+            relevantChunks,
+            recentMessages,
+            userMessage);
+
+        // 6. Build message history for Claude
+        var chatMessages = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = contextPrompt }
+        };
+
+        var chatRequest = new ChatRequest
+        {
+            SystemPrompt = ChatPrompts.SystemPrompt,
+            Messages = chatMessages,
+            MaxTokens = _settings.MaxResponseTokens
+        };
+
+        // 7. Stream response from Claude
+        var responseBuilder = new StringBuilder();
+        var inputTokens = 0;
+        var outputTokens = 0;
+
+        await foreach (var streamEvent in _claudeChat.StreamChatAsync(chatRequest, ct))
+        {
+            if (!string.IsNullOrEmpty(streamEvent.Text))
+            {
+                responseBuilder.Append(streamEvent.Text);
+                yield return new ChatStreamResult
+                {
+                    Type = "token",
+                    Text = streamEvent.Text
+                };
+            }
+
+            if (streamEvent.InputTokens.HasValue)
+                inputTokens = streamEvent.InputTokens.Value;
+
+            if (streamEvent.OutputTokens.HasValue)
+                outputTokens = streamEvent.OutputTokens.Value;
+        }
+
+        // 8. Extract citations from response
+        var responseContent = responseBuilder.ToString();
+        var citedChunkIds = ExtractCitations(responseContent, relevantChunks);
+
+        // 9. Save assistant message
+        var assistantMsg = new Message
+        {
+            Id = Guid.NewGuid(),
+            ConversationId = conversationId,
+            Role = "assistant",
+            Content = responseContent,
+            CitedChunkIds = JsonSerializer.Serialize(citedChunkIds),
+            PromptTokens = inputTokens,
+            CompletionTokens = outputTokens,
+            CreatedAt = DateTime.UtcNow
+        };
+        _dbContext.Messages.Add(assistantMsg);
+
+        // Update conversation timestamp
+        conversation.UpdatedAt = DateTime.UtcNow;
+        await _dbContext.SaveChangesAsync(ct);
+
+        _logger.LogInformation(
+            "Chat response complete: {InputTokens} input, {OutputTokens} output, {CitationCount} citations",
+            inputTokens, outputTokens, citedChunkIds.Count);
+
+        // 10. Return completion event
+        yield return new ChatStreamResult
+        {
+            Type = "complete",
+            MessageId = assistantMsg.Id,
+            CitedChunkIds = citedChunkIds
+        };
+    }
+
+    public async Task<Conversation> CreateConversationAsync(
+        CreateConversationRequest request,
+        CancellationToken ct = default)
+    {
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            TenantId = _currentUser.TenantId!.Value,
+            UserId = _currentUser.UserId!.Value,
+            Title = request.Title,
+            PolicyIds = JsonSerializer.Serialize(request.PolicyIds ?? []),
+            DocumentIds = JsonSerializer.Serialize(request.DocumentIds ?? []),
+            CreatedAt = DateTime.UtcNow
+        };
+
+        _dbContext.Conversations.Add(conversation);
+        await _dbContext.SaveChangesAsync(ct);
+
+        _logger.LogInformation(
+            "Created conversation {ConversationId} with {PolicyCount} policies, {DocumentCount} documents",
+            conversation.Id,
+            request.PolicyIds?.Count ?? 0,
+            request.DocumentIds?.Count ?? 0);
+
+        return conversation;
+    }
+
+    public async Task<ConversationDetail?> GetConversationAsync(
+        Guid conversationId,
+        CancellationToken ct = default)
+    {
+        var conversation = await _dbContext.Conversations
+            .Include(c => c.Messages.OrderBy(m => m.CreatedAt))
+            .FirstOrDefaultAsync(c => c.Id == conversationId, ct);
+
+        if (conversation == null)
+            return null;
+
+        return new ConversationDetail
+        {
+            Id = conversation.Id,
+            Title = conversation.Title,
+            PolicyIds = ParseGuidArray(conversation.PolicyIds),
+            DocumentIds = ParseGuidArray(conversation.DocumentIds),
+            CreatedAt = conversation.CreatedAt,
+            UpdatedAt = conversation.UpdatedAt,
+            Messages = conversation.Messages.Select(m => new MessageDto
+            {
+                Id = m.Id,
+                Role = m.Role,
+                Content = m.Content,
+                CitedChunkIds = ParseGuidArray(m.CitedChunkIds),
+                PromptTokens = m.PromptTokens,
+                CompletionTokens = m.CompletionTokens,
+                CreatedAt = m.CreatedAt
+            }).ToList()
+        };
+    }
+
+    public async Task<List<ConversationSummary>> ListConversationsAsync(
+        CancellationToken ct = default)
+    {
+        var conversations = await _dbContext.Conversations
+            .Where(c => c.UserId == _currentUser.UserId)
+            .OrderByDescending(c => c.UpdatedAt ?? c.CreatedAt)
+            .Select(c => new
+            {
+                c.Id,
+                c.Title,
+                c.PolicyIds,
+                c.DocumentIds,
+                c.CreatedAt,
+                c.UpdatedAt,
+                MessageCount = c.Messages.Count,
+                LastMessage = c.Messages
+                    .OrderByDescending(m => m.CreatedAt)
+                    .Select(m => m.Content)
+                    .FirstOrDefault()
+            })
+            .ToListAsync(ct);
+
+        return conversations.Select(c => new ConversationSummary
+        {
+            Id = c.Id,
+            Title = c.Title,
+            PolicyIds = ParseGuidArray(c.PolicyIds),
+            DocumentIds = ParseGuidArray(c.DocumentIds),
+            CreatedAt = c.CreatedAt,
+            UpdatedAt = c.UpdatedAt,
+            MessageCount = c.MessageCount,
+            LastMessage = c.LastMessage?.Length > 100
+                ? c.LastMessage[..100] + "..."
+                : c.LastMessage
+        }).ToList();
+    }
+
+    public async Task<bool> DeleteConversationAsync(
+        Guid conversationId,
+        CancellationToken ct = default)
+    {
+        var conversation = await _dbContext.Conversations
+            .FirstOrDefaultAsync(c => c.Id == conversationId, ct);
+
+        if (conversation == null)
+            return false;
+
+        _dbContext.Conversations.Remove(conversation);
+        await _dbContext.SaveChangesAsync(ct);
+
+        _logger.LogInformation("Deleted conversation {ConversationId}", conversationId);
+        return true;
+    }
+
+    /// <summary>
+    /// Extract citations from Claude's response by matching page references.
+    /// </summary>
+    private static List<Guid> ExtractCitations(
+        string response,
+        List<ChunkSearchResult> availableChunks)
+    {
+        var citedChunkIds = new List<Guid>();
+
+        // Pattern: [Source: Page X] or [Source: Page X, Section: Y]
+        var citationPattern = CitationRegex();
+
+        foreach (Match match in citationPattern.Matches(response))
+        {
+            var pageStart = int.Parse(match.Groups[1].Value);
+            var pageEnd = match.Groups[2].Success
+                ? int.Parse(match.Groups[2].Value)
+                : pageStart;
+
+            // Find chunk that matches this page range
+            var matchingChunk = availableChunks.FirstOrDefault(c =>
+                c.PageStart.HasValue &&
+                c.PageStart <= pageEnd &&
+                (c.PageEnd ?? c.PageStart) >= pageStart);
+
+            if (matchingChunk != null && !citedChunkIds.Contains(matchingChunk.ChunkId))
+            {
+                citedChunkIds.Add(matchingChunk.ChunkId);
+            }
+        }
+
+        // If no explicit citations found but we used chunks, include top chunks
+        if (citedChunkIds.Count == 0 && availableChunks.Count > 0)
+        {
+            // Include top 3 most relevant chunks as implicit citations
+            citedChunkIds.AddRange(
+                availableChunks
+                    .Take(3)
+                    .Select(c => c.ChunkId));
+        }
+
+        return citedChunkIds;
+    }
+
+    private static List<Guid> ParseGuidArray(string json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<List<Guid>>(json) ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    [GeneratedRegex(@"\[(?:Source|Document)[^\]]*Page\s*(\d+)(?:\s*-\s*(\d+))?[^\]]*\]", RegexOptions.IgnoreCase)]
+    private static partial Regex CitationRegex();
+}

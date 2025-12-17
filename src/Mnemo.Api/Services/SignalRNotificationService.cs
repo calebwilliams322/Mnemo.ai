@@ -41,4 +41,15 @@ public class SignalRNotificationService : INotificationService
 
         await _hubContext.Clients.Group(groupName).SendAsync(method, payload);
     }
+
+    public async Task SendToConversationAsync(Guid conversationId, string method, object payload)
+    {
+        var groupName = $"conversation_{conversationId}";
+
+        _logger.LogDebug(
+            "Sending {Method} notification to conversation group {GroupName}",
+            method, groupName);
+
+        await _hubContext.Clients.Group(groupName).SendAsync(method, payload);
+    }
 }

@@ -74,8 +74,23 @@ builder.Services.Configure<OpenAISettings>(builder.Configuration.GetSection("Ope
 // Configure Claude settings for extraction
 builder.Services.Configure<ClaudeExtractionSettings>(builder.Configuration.GetSection("Claude"));
 
+// Configure Claude Chat settings (uses same API key as extraction)
+builder.Services.Configure<ClaudeChatSettings>(builder.Configuration.GetSection("Claude"));
+
+// Configure Chat settings for RAG
+builder.Services.Configure<ChatSettings>(builder.Configuration.GetSection("Chat"));
+
 // Register all extraction services (PDF, Claude, embeddings)
 builder.Services.AddExtractionServices();
+
+// Register ClaudeChatService for streaming chat
+builder.Services.AddScoped<IClaudeChatService, ClaudeChatService>();
+
+// Register SemanticSearchService for pgvector similarity search
+builder.Services.AddScoped<ISemanticSearchService, SemanticSearchService>();
+
+// Register ChatService for RAG-powered conversations
+builder.Services.AddScoped<IChatService, ChatService>();
 
 // Register ExtractionPipeline (orchestrates Phase 7 services)
 builder.Services.AddScoped<IExtractionPipeline, ExtractionPipeline>();
@@ -1651,6 +1666,144 @@ app.MapPost("/documents/{id:guid}/reprocess", async (
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("ReprocessDocument")
 .WithTags("Documents")
+.RequireRateLimiting("api");
+
+// ============================================================================
+// Chat Endpoints (RAG-powered policy Q&A)
+// ============================================================================
+
+// POST /conversations - Create a new conversation
+app.MapPost("/conversations", async (
+    CreateConversationRequest request,
+    IChatService chatService) =>
+{
+    var conversation = await chatService.CreateConversationAsync(request);
+
+    return Results.Created($"/conversations/{conversation.Id}", new
+    {
+        id = conversation.Id,
+        title = conversation.Title,
+        policyIds = JsonSerializer.Deserialize<List<Guid>>(conversation.PolicyIds),
+        documentIds = JsonSerializer.Deserialize<List<Guid>>(conversation.DocumentIds),
+        createdAt = conversation.CreatedAt
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("CreateConversation")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
+// GET /conversations - List user's conversations
+app.MapGet("/conversations", async (
+    IChatService chatService) =>
+{
+    var conversations = await chatService.ListConversationsAsync();
+    return Results.Ok(conversations);
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("ListConversations")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
+// GET /conversations/{id} - Get conversation with message history
+app.MapGet("/conversations/{id:guid}", async (
+    Guid id,
+    IChatService chatService) =>
+{
+    var conversation = await chatService.GetConversationAsync(id);
+    if (conversation == null)
+        return Results.NotFound("Conversation not found");
+
+    return Results.Ok(conversation);
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetConversation")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
+// POST /conversations/{id}/messages - Send message (streaming via SSE)
+app.MapPost("/conversations/{id:guid}/messages", async (
+    Guid id,
+    SendMessageRequest request,
+    IChatService chatService,
+    HttpContext httpContext,
+    CancellationToken ct) =>
+{
+    httpContext.Response.ContentType = "text/event-stream";
+    httpContext.Response.Headers.CacheControl = "no-cache";
+    httpContext.Response.Headers.Connection = "keep-alive";
+
+    try
+    {
+        await foreach (var evt in chatService.SendMessageAsync(id, request.Content, ct))
+        {
+            var json = JsonSerializer.Serialize(evt);
+            await httpContext.Response.WriteAsync($"data: {json}\n\n", ct);
+            await httpContext.Response.Body.FlushAsync(ct);
+        }
+
+        await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
+    }
+    catch (OperationCanceledException)
+    {
+        // Client disconnected, this is expected
+    }
+    catch (Exception ex)
+    {
+        var errorEvent = JsonSerializer.Serialize(new { type = "error", error = ex.Message });
+        await httpContext.Response.WriteAsync($"data: {errorEvent}\n\n", ct);
+    }
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("SendMessage")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
+// GET /conversations/{id}/messages - Get message history
+app.MapGet("/conversations/{id:guid}/messages", async (
+    Guid id,
+    int? limit,
+    IChatService chatService) =>
+{
+    var conversation = await chatService.GetConversationAsync(id);
+    if (conversation == null)
+        return Results.NotFound("Conversation not found");
+
+    var messages = conversation.Messages
+        .OrderBy(m => m.CreatedAt)
+        .TakeLast(limit ?? 50)
+        .Select(m => new
+        {
+            id = m.Id,
+            role = m.Role,
+            content = m.Content,
+            citedChunkIds = m.CitedChunkIds,
+            promptTokens = m.PromptTokens,
+            completionTokens = m.CompletionTokens,
+            createdAt = m.CreatedAt
+        });
+
+    return Results.Ok(messages);
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("GetMessages")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
+// DELETE /conversations/{id} - Delete conversation
+app.MapDelete("/conversations/{id:guid}", async (
+    Guid id,
+    IChatService chatService) =>
+{
+    var deleted = await chatService.DeleteConversationAsync(id);
+    if (!deleted)
+        return Results.NotFound("Conversation not found");
+
+    return Results.NoContent();
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("DeleteConversation")
+.WithTags("Chat")
 .RequireRateLimiting("api");
 
 app.Run();

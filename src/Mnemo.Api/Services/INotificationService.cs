@@ -14,4 +14,9 @@ public interface INotificationService
     /// Send a notification to users watching a specific document.
     /// </summary>
     Task SendToDocumentAsync(Guid documentId, string method, object payload);
+
+    /// <summary>
+    /// Send a notification to users in a specific conversation.
+    /// </summary>
+    Task SendToConversationAsync(Guid conversationId, string method, object payload);
 }

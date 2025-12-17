@@ -14,7 +14,8 @@ namespace Mnemo.Api.Tests;
 /// <summary>
 /// Integration tests for webhook CRUD endpoints.
 /// </summary>
-public class WebhookTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
+[Collection("Integration")]
+public class WebhookTests : IAsyncLifetime
 {
     private readonly CustomWebApplicationFactory _factory;
     private Tenant? _testTenant;

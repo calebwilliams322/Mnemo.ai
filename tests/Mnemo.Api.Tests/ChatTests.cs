@@ -15,7 +15,8 @@ namespace Mnemo.Api.Tests;
 /// Integration tests for RAG Chat System endpoints.
 /// Tests conversation CRUD, message handling, and tenant isolation.
 /// </summary>
-public class ChatTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
+[Collection("Integration")]
+public class ChatTests : IAsyncLifetime
 {
     private readonly CustomWebApplicationFactory _factory;
     private Tenant? _testTenant;

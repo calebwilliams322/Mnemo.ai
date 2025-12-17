@@ -17,7 +17,8 @@ using Mnemo.Infrastructure.Persistence;
 
 namespace Mnemo.Api.Tests;
 
-public class AuthenticationTests : IClassFixture<CustomWebApplicationFactory>, IAsyncLifetime
+[Collection("Integration")]
+public class AuthenticationTests : IAsyncLifetime
 {
     private readonly CustomWebApplicationFactory _factory;
     private readonly HttpClient _client;
@@ -196,7 +197,8 @@ public class AuthenticationTests : IClassFixture<CustomWebApplicationFactory>, I
 /// Tests for the signup endpoint (/auth/signup).
 /// These test input validation and the full signup flow with real Supabase integration.
 /// </summary>
-public class SignupTests : IClassFixture<CustomWebApplicationFactory>
+[Collection("Integration")]
+public class SignupTests
 {
     private readonly CustomWebApplicationFactory _factory;
 

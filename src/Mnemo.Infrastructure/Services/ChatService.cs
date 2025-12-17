@@ -126,7 +126,15 @@ public partial class ChatService : IChatService
             yield break;
         }
 
-        // 2. Save user message
+        // 2. Capture existing message history BEFORE adding new message
+        // (EF Core fixes up navigation properties, so we must snapshot first)
+        var existingMessageCount = conversation.Messages.Count;
+        var historyMessages = conversation.Messages
+            .TakeLast(_settings.MaxHistoryMessages)
+            .Select(m => new ChatMessage { Role = m.Role, Content = m.Content })
+            .ToList();
+
+        // 3. Save user message
         var userMsg = new Message
         {
             Id = Guid.NewGuid(),
@@ -139,8 +147,7 @@ public partial class ChatService : IChatService
         _dbContext.Messages.Add(userMsg);
         await _dbContext.SaveChangesAsync(ct);
 
-        // 3. Determine if RAG lookup is needed (skip for greetings, simple follow-ups)
-        var existingMessageCount = conversation.Messages.Count;
+        // 4. Determine if RAG lookup is needed (skip for greetings, simple follow-ups)
         var performRag = ShouldPerformRagLookup(userMessage, existingMessageCount);
 
         List<ChunkSearchResult> relevantChunks = [];
@@ -185,24 +192,11 @@ public partial class ChatService : IChatService
                 "Skipping RAG lookup for message (greeting/simple follow-up)");
         }
 
-        // 6. Build message history for Claude (proper multi-turn format)
-        var chatMessages = new List<ChatMessage>();
+        // 7. Build message history for Claude (proper multi-turn format)
+        // Use pre-captured history (before new message was added)
+        var chatMessages = new List<ChatMessage>(historyMessages);
 
-        // Add conversation history as separate messages (last N messages)
-        var recentMessages = conversation.Messages
-            .TakeLast(_settings.MaxHistoryMessages)
-            .ToList();
-
-        foreach (var msg in recentMessages)
-        {
-            chatMessages.Add(new ChatMessage
-            {
-                Role = msg.Role,
-                Content = msg.Content
-            });
-        }
-
-        // 7. Build the current user message with RAG context (if applicable)
+        // 8. Build the current user message with RAG context (if applicable)
         var currentUserContent = relevantChunks.Count > 0
             ? ChatPrompts.BuildContextPrompt(relevantChunks, userMessage)
             : userMessage;
@@ -220,7 +214,7 @@ public partial class ChatService : IChatService
             MaxTokens = _settings.MaxResponseTokens
         };
 
-        // 8. Stream response from Claude
+        // 9. Stream response from Claude
         var responseBuilder = new StringBuilder();
         var inputTokens = 0;
         var outputTokens = 0;
@@ -244,11 +238,11 @@ public partial class ChatService : IChatService
                 outputTokens = streamEvent.OutputTokens.Value;
         }
 
-        // 8. Extract citations from response
+        // 10. Extract citations from response
         var responseContent = responseBuilder.ToString();
         var citedChunkIds = ExtractCitations(responseContent, relevantChunks);
 
-        // 9. Save assistant message
+        // 11. Save assistant message
         var assistantMsg = new Message
         {
             Id = Guid.NewGuid(),
@@ -270,7 +264,7 @@ public partial class ChatService : IChatService
             "Chat response complete: {InputTokens} input, {OutputTokens} output, {CitationCount} citations",
             inputTokens, outputTokens, citedChunkIds.Count);
 
-        // 10. Return completion event
+        // 12. Return completion event
         yield return new ChatStreamResult
         {
             Type = "complete",

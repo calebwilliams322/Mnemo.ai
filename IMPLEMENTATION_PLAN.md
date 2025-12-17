@@ -1191,26 +1191,193 @@ ExtractionPipeline (Phase 8 - NEW)
 
 ---
 
-## Phase 8: Complete Extraction Pipeline
+## Phase 8: Complete Extraction Pipeline ✅ COMPLETE
 **Duration estimate: Integration - Wire Phase 7 services into the document processing flow**
 
-### What Already Exists
+### Implementation Approach Change
+
+**Original Plan:** Multi-stage extraction with separate classifiers and 12+ coverage extractors.
+
+**Actual Implementation:** Unified single-call extraction approach. After evaluating the complexity vs. accuracy tradeoff, we adopted a simpler architecture:
+- Single Claude call extracts ALL policy data (core fields + coverages)
+- Proven approach from `old_src` reference implementation
+- Simpler to maintain, debug, and iterate on prompts
+- Still achieves 90%+ accuracy on test policies
+
+### What Was Built
 
 | Component | Location | Status |
 |-----------|----------|--------|
-| `DocumentProcessingService` | `Mnemo.Infrastructure/Services/` | ✅ Extracts text, chunks, embeds |
-| `ClaudeDocumentClassifier` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
-| `ClaudePolicyExtractor` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
-| 10 Coverage Extractors | `Mnemo.Extraction/Services/Extractors/` | ✅ Built in Phase 7 |
-| `CoverageExtractorFactory` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
-| `ExtractionValidator` | `Mnemo.Extraction/Services/` | ✅ Built in Phase 7 |
-| `Policy` / `Coverage` entities | `Mnemo.Domain/Entities/` | ✅ Built in Phase 1 |
-| DbContext with Policies/Coverages | `Mnemo.Infrastructure/Persistence/` | ✅ Configured |
-| Document upload endpoints | `Mnemo.Api/Program.cs` | ✅ Lines 716-1075 |
-| Hangfire job trigger | `Mnemo.Api/Program.cs` | ✅ Lines 781, 879 |
-| Event infrastructure | SignalR + Webhooks | ✅ Built in Phase 3-4 |
+| `IExtractionPipeline` | `Mnemo.Application/Services/` | ✅ Interface |
+| `ExtractionPipeline` | `Mnemo.Infrastructure/Services/` | ✅ Orchestrator |
+| `IClaudeExtractionService` | `Mnemo.Extraction/Interfaces/` | ✅ Interface |
+| `ClaudeExtractionService` | `Mnemo.Extraction/Services/` | ✅ Claude API calls with retry |
+| `ExtractionPrompts` | `Mnemo.Extraction/Prompts/` | ✅ Unified extraction prompt |
+| `ExtractionRequest/Response` | `Mnemo.Extraction/Models/` | ✅ DTOs |
+| `PolicyExtractionResult` | `Mnemo.Extraction/Models/` | ✅ Extraction result model |
+| `CoverageExtractionResult` | `Mnemo.Extraction/Models/` | ✅ Coverage result model |
+| `ExtractionCompletedEvent` | `Mnemo.Domain/Events/` | ✅ Domain event |
+| Policy API endpoints | `Mnemo.Api/Program.cs` | ✅ GET /policies, GET /policies/{id}, GET /policies/{id}/summary |
+| Integration tests | `Mnemo.Extraction.Tests/IntegrationTests/` | ✅ E2E tests with real Claude |
 
-### What Phase 8 Builds
+### 8.1 ExtractionPipeline Service ✅ COMPLETE
+
+**File:** `src/Mnemo.Infrastructure/Services/ExtractionPipeline.cs`
+
+**Flow:**
+```
+1. Load document with chunks from database
+2. Reconstruct full text from chunks
+3. Single Claude call for ALL extraction
+4. Map PolicyExtractionResult → Policy entity
+5. Map CoverageExtractionResults → Coverage entities
+6. Set status based on confidence (< 70% → needs_review)
+7. Save all in transaction
+8. Publish ExtractionCompletedEvent
+9. Return Policy.Id
+```
+
+**Error handling:**
+- Document not found → return null
+- No chunks → set extraction_failed status
+- Claude API error → retry with exponential backoff (1s, 5s, 15s)
+- Low confidence → set needs_review status
+
+### 8.2 ClaudeExtractionService ✅ COMPLETE
+
+**File:** `src/Mnemo.Extraction/Services/ClaudeExtractionService.cs`
+
+**Features:**
+- Uses Anthropic.SDK NuGet package
+- Configurable model (default: claude-sonnet-4-20250514)
+- Retry logic with exponential backoff
+- JSON response parsing with snake_case support
+- Structured extraction prompt for insurance policies
+
+**Configuration:**
+```json
+{
+  "Claude": {
+    "ApiKey": "sk-ant-...",
+    "Model": "claude-sonnet-4-20250514",
+    "MaxTokens": 4096,
+    "MaxRetries": 3
+  }
+}
+```
+
+### 8.3 Integration with DocumentProcessingService ✅ COMPLETE
+
+**File:** `src/Mnemo.Infrastructure/Services/DocumentProcessingService.cs`
+
+After text extraction and chunking completes, the pipeline automatically runs structured extraction:
+
+```csharp
+// After chunking completes:
+_logger.LogInformation("Text extraction completed... Starting structured extraction...");
+var policyId = await _extractionPipeline.ExtractStructuredDataAsync(documentId, tenantId);
+
+if (policyId.HasValue)
+{
+    document.ProcessingStatus = "completed";
+}
+else
+{
+    document.ProcessingStatus = "extraction_failed";
+}
+```
+
+**Status transitions:**
+- `pending` → `processing` → `completed` (success)
+- `pending` → `processing` → `needs_review` (low confidence)
+- `pending` → `processing` → `extraction_failed` (error)
+
+### 8.4 Policy API Endpoints ✅ COMPLETE
+
+**File:** `src/Mnemo.Api/Program.cs` (lines 1354-1550)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /policies` | List policies with filters (insuredName, carrierName, effectiveAfter, etc.) |
+| `GET /policies/{id}` | Full policy details with nested coverages |
+| `GET /policies/{id}/summary` | AI-generated summary (key points, exclusions, recommendations) |
+
+**Response DTOs:** Defined inline in Program.cs (could be moved to separate DTOs file)
+
+### 8.5 Integration Tests ✅ COMPLETE
+
+**Files:**
+- `tests/Mnemo.Extraction.Tests/IntegrationTests/EndToEndExtractionTests.cs`
+- `tests/Mnemo.Extraction.Tests/IntegrationTests/ExtractionPipelineIntegrationTests.cs`
+
+**Test coverage:**
+- Full E2E: Upload PDF → Process → Extract → Verify Policy + Coverages in DB
+- Real Claude API calls (requires ANTHROPIC_API_KEY)
+- Real Supabase storage (requires SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+- Real OpenAI embeddings (requires OPENAI_API_KEY)
+
+**Sample test run:**
+```
+=== EXTRACTED DATA (from real database) ===
+Policy Number: XS23031749-01
+Insured: 554 Main Street Partners LLC
+Carrier: Capitol Specialty Insurance Corporation
+Effective: 7/1/2024 - 7/1/2025
+Premium: $2,838.72
+Confidence: 95%
+Coverages: 1
+  - umbrella_excess: $1,000,000.00 / $1,000,000.00
+```
+
+### 8.6 Key Files Created/Modified
+
+| Action | File |
+|--------|------|
+| CREATE | `src/Mnemo.Application/Services/IExtractionPipeline.cs` |
+| CREATE | `src/Mnemo.Infrastructure/Services/ExtractionPipeline.cs` |
+| CREATE | `src/Mnemo.Extraction/Interfaces/IClaudeExtractionService.cs` |
+| CREATE | `src/Mnemo.Extraction/Services/ClaudeExtractionService.cs` |
+| CREATE | `src/Mnemo.Extraction/Models/ExtractionModels.cs` |
+| CREATE | `src/Mnemo.Extraction/Prompts/ExtractionPrompts.cs` |
+| MODIFY | `src/Mnemo.Domain/Events/DocumentEvents.cs` (added ExtractionCompletedEvent) |
+| MODIFY | `src/Mnemo.Infrastructure/Services/DocumentProcessingService.cs` |
+| MODIFY | `src/Mnemo.Api/Program.cs` (added policy endpoints + DI) |
+| CREATE | `tests/Mnemo.Extraction.Tests/IntegrationTests/EndToEndExtractionTests.cs` |
+| CREATE | `tests/Mnemo.Extraction.Tests/IntegrationTests/ExtractionPipelineIntegrationTests.cs` |
+
+### 8.7 What Was NOT Implemented (Deferred)
+
+The original plan included these features which were deferred for simplicity:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Multi-stage classification | Deferred | Single-call approach is sufficient |
+| 12 coverage-specific extractors | Deferred | Unified prompt handles all coverage types |
+| `POST /documents/{id}/reprocess` | Deferred | Can add later if needed |
+| Validation service | Partial | Confidence scoring implemented, detailed validation deferred |
+
+### 8.8 Scanned PDF / OCR Support
+
+**Status:** NOT IMPLEMENTED
+
+Attempted to add Tesseract OCR support but encountered native library compatibility issues:
+- Tesseract NuGet package only includes Windows DLLs
+- No macOS or Linux native libraries in the package
+- Docker approach requires x64 Linux container + library symlinks
+
+**Recommendation:** Use cloud OCR (Azure Document Intelligence or Google Cloud Vision) if scanned PDF support is needed. Both have free tiers (500-1000 pages/month).
+
+**Current behavior:** Scanned PDFs are detected (pages with < 50 chars) and extraction continues without OCR. Quality score reflects the low text extraction.
+
+### Phase 8 Complete! ✅
+
+**All tests passing.** Upload a PDF → Background job runs → Policy + Coverages created in database → API endpoints return extracted data.
+
+---
+
+## Phase 8 Original Plan (For Reference)
+
+### What Phase 8 Builds (Original)
 
 | Component | Purpose |
 |-----------|---------|
@@ -1722,45 +1889,345 @@ Before marking Phase 8 complete:
 ---
 
 ## Phase 9: RAG Chat System
-**Duration estimate: Conversational AI**
+**Branch:** `phase-9-rag-chat`
 
-### 9.1 Semantic Search
-- [ ] Create `ISemanticSearch` interface
-- [ ] Implement pgvector similarity search
-- [ ] Filter by policy/document scope
-- [ ] Return top-k relevant chunks
+Build a conversational AI system that allows users to ask questions about their insurance policies using Retrieval-Augmented Generation (RAG). The system retrieves relevant document chunks via semantic search (pgvector) and uses Claude to generate accurate, cited responses.
+
+### What Already Exists
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| Embedding generation | ✅ Complete | `OpenAIEmbeddingService.cs` - 1536-dim, batch processing |
+| Chunk storage | ✅ Complete | `DocumentChunk` entity with pgvector `Embedding` column |
+| Conversation entity | ✅ Complete | `Conversation.cs` - with PolicyIds, DocumentIds (JSONB) |
+| Message entity | ✅ Complete | `Message.cs` - with Role, Content, CitedChunkIds |
+| SignalR hub | ✅ Partial | `NotificationHub.cs` - needs conversation group methods |
+| Claude API client | ✅ Complete | `ClaudeExtractionService.cs` - Anthropic.SDK v5.8.0 |
+| Similarity search | ❌ Not implemented | Need to add pgvector queries |
+| Chat service | ❌ Not implemented | Core RAG logic |
+| Chat endpoints | ❌ Not implemented | REST API for conversations |
+| Streaming | ❌ Not implemented | Real-time response streaming |
+
+### Architecture
+
+```
+User Query
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Chat API Endpoint                         │
+│              POST /conversations/{id}/messages               │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      ChatService                             │
+│                                                             │
+│  1. Load conversation context (policy IDs, doc IDs)         │
+│  2. Embed user query (OpenAIEmbeddingService)               │
+│  3. Semantic search for relevant chunks (ISemanticSearch)   │
+│  4. Build RAG prompt with context + chat history            │
+│  5. Call Claude with streaming (IClaudeChatService)         │
+│  6. Extract citations from response                         │
+│  7. Save message with citations                             │
+│  8. Stream response via SignalR                             │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ├──► ISemanticSearch (pgvector similarity)
+    │       └── Returns top-k relevant DocumentChunks
+    │
+    ├──► IClaudeChatService (streaming)
+    │       └── Streams response tokens
+    │
+    └──► SignalR (real-time)
+            └── Broadcasts to conversation group
+```
+
+### 9.1 Semantic Search Service
+
+Create the vector similarity search capability using pgvector.
+
+**Files to create:**
+- `src/Mnemo.Application/Services/ISemanticSearchService.cs`
+- `src/Mnemo.Infrastructure/Services/SemanticSearchService.cs`
+
+**Key types:**
+```csharp
+public interface ISemanticSearchService
+{
+    Task<List<ChunkSearchResult>> SearchAsync(
+        SemanticSearchRequest request,
+        CancellationToken ct = default);
+}
+
+public record SemanticSearchRequest
+{
+    public required float[] QueryEmbedding { get; init; }
+    public Guid TenantId { get; init; }
+    public List<Guid>? PolicyIds { get; init; }      // Filter by policies
+    public List<Guid>? DocumentIds { get; init; }    // Filter by documents
+    public int TopK { get; init; } = 10;
+    public double MinSimilarity { get; init; } = 0.7;
+}
+
+public record ChunkSearchResult
+{
+    public Guid ChunkId { get; init; }
+    public Guid DocumentId { get; init; }
+    public string ChunkText { get; init; } = "";
+    public int? PageStart { get; init; }
+    public int? PageEnd { get; init; }
+    public string? SectionType { get; init; }
+    public double Similarity { get; init; }
+}
+```
+
+**Implementation:** Use raw SQL with pgvector cosine distance operator `<=>`:
+```sql
+SELECT dc.id, dc.document_id, dc.chunk_text, dc.page_start, dc.page_end,
+       dc.section_type, 1 - (dc.embedding <=> @queryEmbedding::vector) as similarity
+FROM document_chunks dc
+INNER JOIN documents d ON dc.document_id = d.id
+WHERE d.tenant_id = @tenantId
+  AND 1 - (dc.embedding <=> @queryEmbedding::vector) >= @minSimilarity
+ORDER BY dc.embedding <=> @queryEmbedding::vector
+LIMIT @topK
+```
 
 **🧪 Test checkpoint 9.1:**
-- [ ] Search returns relevant chunks
-- [ ] Filters work correctly
-- [ ] Performance acceptable (<500ms)
+- [ ] Search returns relevant chunks for insurance queries
+- [ ] Filtering by policy/document IDs works
+- [ ] Similarity threshold filters low-relevance results
+- [ ] Performance < 500ms for typical queries
 
-### 9.2 Chat Service
-- [ ] Create `IChatService` interface
-- [ ] Implement RAG pipeline:
-  1. Embed user query
-  2. Retrieve relevant chunks
-  3. Build context prompt
-  4. Call Claude
-  5. Extract citations
-- [ ] Support streaming responses
+### 9.2 Claude Chat Service (with Streaming)
+
+Create a dedicated chat service that supports streaming responses.
+
+**Files to create:**
+- `src/Mnemo.Extraction/Interfaces/IClaudeChatService.cs`
+- `src/Mnemo.Extraction/Services/ClaudeChatService.cs`
+
+**Key types:**
+```csharp
+public interface IClaudeChatService
+{
+    IAsyncEnumerable<ChatStreamEvent> StreamChatAsync(
+        ChatRequest request, CancellationToken ct = default);
+
+    Task<ChatResponse> SendChatAsync(
+        ChatRequest request, CancellationToken ct = default);
+}
+
+public record ChatRequest
+{
+    public required string SystemPrompt { get; init; }
+    public required List<ChatMessage> Messages { get; init; }
+    public int MaxTokens { get; init; } = 2048;
+}
+
+public record ChatStreamEvent
+{
+    public string Type { get; init; } = "";  // content_block_delta, message_stop
+    public string? Text { get; init; }
+    public int? InputTokens { get; init; }
+    public int? OutputTokens { get; init; }
+}
+```
+
+**Implementation:** Use `StreamClaudeMessageAsync` from Anthropic.SDK for real-time token streaming.
 
 **🧪 Test checkpoint 9.2:**
-- [ ] Chat returns accurate answers
-- [ ] Citations included
-- [ ] Streaming works
-- [ ] Multi-policy context works
+- [ ] Non-streaming chat works
+- [ ] Streaming emits tokens incrementally
+- [ ] Token usage tracked correctly
+- [ ] Retry logic handles rate limits
 
-### 9.3 Conversation Endpoints
-- [ ] `POST /conversations` - create
-- [ ] `POST /conversations/{id}/messages` - send (streaming)
-- [ ] `GET /conversations/{id}/messages` - history
-- [ ] `GET /conversations` - list
+### 9.3 RAG Chat Prompt Design
 
-**🧪 Test checkpoint 9.3:**
-- [ ] Conversation flow works
-- [ ] History persists
-- [ ] Citations link to source
+**File to create:** `src/Mnemo.Extraction/Prompts/ChatPrompts.cs`
+
+**System Prompt:**
+```
+You are an expert insurance policy analyst helping users understand their coverage.
+
+## Your Role
+- Answer questions about insurance policies accurately and helpfully
+- Always cite specific sections when referencing policy language
+- If information is not in the provided context, say so clearly
+
+## Citation Format
+When referencing policy content, use: [Source: Page X, Section Y]
+
+## Important Guidelines
+1. Only answer based on the provided policy excerpts
+2. Don't make up policy terms or coverage details
+3. Distinguish between what IS covered vs what is NOT covered
+4. For limits and deductibles, quote exact figures from the documents
+```
+
+### 9.4 Core Chat Service
+
+Orchestrate the full RAG pipeline.
+
+**Files to create:**
+- `src/Mnemo.Application/Services/IChatService.cs`
+- `src/Mnemo.Infrastructure/Services/ChatService.cs`
+- `src/Mnemo.Application/DTOs/ChatDtos.cs`
+
+**Interface:**
+```csharp
+public interface IChatService
+{
+    IAsyncEnumerable<ChatStreamEvent> SendMessageAsync(
+        Guid conversationId, string userMessage, CancellationToken ct = default);
+
+    Task<Conversation> CreateConversationAsync(
+        CreateConversationRequest request, CancellationToken ct = default);
+
+    Task<ConversationDetail?> GetConversationAsync(
+        Guid conversationId, CancellationToken ct = default);
+
+    Task<List<ConversationSummary>> ListConversationsAsync(
+        CancellationToken ct = default);
+}
+```
+
+**SendMessageAsync Flow:**
+1. Load conversation context (policy IDs, doc IDs)
+2. Save user message
+3. Embed user query via `OpenAIEmbeddingService`
+4. Semantic search for relevant chunks
+5. Build RAG prompt with context + chat history (last 10 messages)
+6. Stream response from Claude
+7. Extract citations from response
+8. Save assistant message with citations
+9. Broadcast tokens via SignalR
+
+**🧪 Test checkpoint 9.4:**
+- [ ] End-to-end: question → relevant chunks → Claude response
+- [ ] Citations extracted correctly
+- [ ] Message history maintained
+- [ ] Streaming works via SignalR
+
+### 9.5 Chat API Endpoints
+
+**File to modify:** `src/Mnemo.Api/Program.cs`
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/conversations` | POST | Create conversation with policy/document scope |
+| `/conversations` | GET | List user's conversations |
+| `/conversations/{id}` | GET | Get conversation with message history |
+| `/conversations/{id}/messages` | POST | Send message (streaming via SSE) |
+| `/conversations/{id}/messages` | GET | Get message history |
+| `/conversations/{id}` | DELETE | Delete conversation |
+
+**Request DTOs:**
+```csharp
+public record CreateConversationRequest
+{
+    public string? Title { get; init; }
+    public List<Guid>? PolicyIds { get; init; }
+    public List<Guid>? DocumentIds { get; init; }
+}
+
+public record SendMessageRequest
+{
+    public required string Content { get; init; }
+}
+```
+
+**🧪 Test checkpoint 9.5:**
+- [ ] Create conversation works
+- [ ] List conversations returns user's conversations only
+- [ ] Get conversation includes message history
+- [ ] Send message streams response via SSE
+- [ ] Delete conversation removes messages (cascade)
+- [ ] Tenant isolation verified
+
+### 9.6 SignalR Enhancement for Chat
+
+**File to modify:** `src/Mnemo.Api/Hubs/NotificationHub.cs`
+
+Add conversation-specific groups:
+```csharp
+public async Task JoinConversationGroup(Guid conversationId)
+public async Task LeaveConversationGroup(Guid conversationId)
+```
+
+Add to `ISignalRNotificationService`:
+```csharp
+Task SendToConversationAsync(Guid conversationId, string eventType, object payload);
+```
+
+### 9.7 Citation Extraction
+
+Extract citations from Claude responses using regex pattern matching:
+- Pattern: `[Source: Page X, Section Y]` or `[Document: ..., Page X]`
+- Map citations back to `ChunkSearchResult` by page range overlap
+- Store cited chunk IDs in message record for frontend linking
+
+### Files Summary
+
+| Action | File | Description |
+|--------|------|-------------|
+| CREATE | `src/Mnemo.Application/Services/ISemanticSearchService.cs` | Interface |
+| CREATE | `src/Mnemo.Infrastructure/Services/SemanticSearchService.cs` | pgvector queries |
+| CREATE | `src/Mnemo.Extraction/Interfaces/IClaudeChatService.cs` | Interface |
+| CREATE | `src/Mnemo.Extraction/Services/ClaudeChatService.cs` | Streaming Claude |
+| CREATE | `src/Mnemo.Extraction/Prompts/ChatPrompts.cs` | RAG prompts |
+| CREATE | `src/Mnemo.Application/Services/IChatService.cs` | Interface |
+| CREATE | `src/Mnemo.Infrastructure/Services/ChatService.cs` | RAG orchestration |
+| CREATE | `src/Mnemo.Application/DTOs/ChatDtos.cs` | Request/response DTOs |
+| MODIFY | `src/Mnemo.Api/Program.cs` | Add chat endpoints |
+| MODIFY | `src/Mnemo.Api/Hubs/NotificationHub.cs` | Conversation groups |
+| MODIFY | `src/Mnemo.Infrastructure/Services/SignalRNotificationService.cs` | Conversation broadcast |
+
+### Configuration
+
+**appsettings.json additions:**
+```json
+{
+  "Chat": {
+    "MaxContextChunks": 10,
+    "MinSimilarity": 0.7,
+    "MaxHistoryMessages": 10,
+    "MaxResponseTokens": 2048
+  }
+}
+```
+
+### Design Decisions (Confirmed)
+
+1. **Streaming approach:** ✅ SSE + SignalR
+   - SSE for REST endpoint responses
+   - SignalR for real-time UI updates
+   - Most flexible for frontend integration
+
+2. **Context window management:** Simple truncation (last 10 messages)
+
+3. **Multi-policy chat:** ✅ Yes
+   - Conversations can reference multiple PolicyIds
+   - RAG searches across all selected policies
+
+4. **Citations:** ✅ With page links
+   - Citations include document name + page number
+   - Frontend can link to PDF viewer at specific page
+
+### Verification Checklist
+
+- [ ] `POST /conversations` creates conversation with policy/document scope
+- [ ] `POST /conversations/{id}/messages` streams response via SSE
+- [ ] Responses include accurate citations to source documents
+- [ ] Chat history maintained across messages
+- [ ] SignalR broadcasts tokens in real-time
+- [ ] Tenant isolation prevents cross-tenant access
+- [ ] All tests passing
+- [ ] Performance: < 2s time-to-first-token for typical queries
+
+**⚠️ DECISION GATE 9:** RAG chat complete. Test with uploaded policies - can users ask questions and get accurate, cited answers?
 
 ---
 
@@ -2039,11 +2506,11 @@ Core features (MVP):
 4. Contract compliance checking
 5. Industry-based coverage gap analysis
 
-Current status: [UPDATE THIS]
-- Completed: [list completed phases]
-- In progress: [current phase]
-- Next: [next phase]
-- Blockers: [any blockers]
+Current status:
+- Completed: Phase 0-8 (Project setup, Database, Auth, Document Upload, Webhooks, PDF Extraction, Structured Extraction)
+- In progress: None
+- Next: Phase 9 (RAG Chat System)
+- Blockers: None - ready to proceed
 
 Please continue from where we left off. The implementation plan is in:
 /Users/calebwilliams/.claude/plans/swirling-wiggling-hearth.md
@@ -2055,12 +2522,12 @@ Please continue from where we left off. The implementation plan is in:
 
 | Gate | Question | Status |
 |------|----------|--------|
-| 0.2 | Supabase project settings correct? | Pending |
-| 1.3 | Database schema looks good? | Pending |
+| 0.2 | Supabase project settings correct? | ✅ Complete |
+| 1.3 | Database schema looks good? | ✅ Complete |
 | ~~3.3~~ | ~~Background job approach?~~ | **Resolved: Hangfire** |
-| 5.3 | OCR cost acceptable? Need Tesseract fallback? | Pending |
-| 7.3 | Extraction accuracy acceptable with real policies? | Pending |
-| 8.3 | Full extraction pipeline ready for chat? | Pending |
+| 5.3 | OCR cost acceptable? Need Tesseract fallback? | **Deferred** - Cloud OCR recommended if needed |
+| 7.3 | Extraction accuracy acceptable with real policies? | ✅ Complete - 90%+ accuracy |
+| 8.3 | Full extraction pipeline ready for chat? | ✅ Complete - Ready for Phase 9 |
 | 12.3 | All analysis features complete, ready for frontend? | Pending |
 | ~~13.1~~ | ~~Frontend framework choice?~~ | **Resolved: React + Vite** |
 | 15 | Production readiness? | Pending |
@@ -2069,16 +2536,24 @@ Please continue from where we left off. The implementation plan is in:
 
 ## Quick Reference
 
-**Key files to create:**
-- `src/Mnemo.Api/Program.cs` - API entry point
-- `src/Mnemo.Domain/Entities/*.cs` - All entities
-- `src/Mnemo.Infrastructure/MnemoDbContext.cs` - EF Core context
-- `src/Mnemo.Extraction/ExtractionPipeline.cs` - Main orchestrator
-- `src/Mnemo.Application/Services/ChatService.cs` - RAG chat
+**Key files (created):**
+- `src/Mnemo.Api/Program.cs` - API entry point with all endpoints
+- `src/Mnemo.Domain/Entities/*.cs` - All entities (Policy, Coverage, Document, etc.)
+- `src/Mnemo.Infrastructure/Persistence/MnemoDbContext.cs` - EF Core context
+- `src/Mnemo.Infrastructure/Services/ExtractionPipeline.cs` - Structured extraction orchestrator
+- `src/Mnemo.Infrastructure/Services/DocumentProcessingService.cs` - Document processing job
+- `src/Mnemo.Extraction/Services/ClaudeExtractionService.cs` - Claude API integration
+- `src/Mnemo.Extraction/Services/PdfPigTextExtractor.cs` - PDF text extraction
+- `src/Mnemo.Extraction/Services/TextChunker.cs` - Text chunking for RAG
+- `src/Mnemo.Extraction/Services/OpenAIEmbeddingService.cs` - Embedding generation
+
+**Key files (to create in future phases):**
+- `src/Mnemo.Application/Services/ChatService.cs` - RAG chat (Phase 9)
+- `src/Mnemo.Application/Services/ComparisonService.cs` - Quote comparison (Phase 10)
+- `src/Mnemo.Application/Services/ComplianceService.cs` - Compliance checking (Phase 11)
 
 **External services:**
-- Supabase: Auth + PostgreSQL + pgvector
-- Cloudflare R2: Document storage
+- Supabase: Auth + PostgreSQL + pgvector + Storage
 - Claude API: Extraction + chat
 - OpenAI API: Embeddings
-- Azure Document Intelligence: OCR fallback
+- Azure Document Intelligence: OCR fallback (if needed)

@@ -39,6 +39,18 @@ var supabaseSettings = builder.Configuration
 builder.Services.AddOpenApi();
 builder.Services.AddHttpContextAccessor();
 
+// Configure CORS for frontend
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.WithOrigins("http://localhost:3000", "http://127.0.0.1:3000")
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
+
 // Register DbContext with pgvector support
 // NpgsqlDataSourceBuilder is required for Npgsql 8+ to properly handle Vector type parameters in queries
 // UseVector() must be called on BOTH the data source builder AND the EF Core options
@@ -162,6 +174,22 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
         options.Events = new JwtBearerEvents
         {
+            // Handle SignalR token from query string (WebSocket/SSE don't support headers)
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
+
+                logger.LogInformation("OnMessageReceived: Path={Path}, HasToken={HasToken}", path, !string.IsNullOrEmpty(accessToken));
+
+                if (!string.IsNullOrEmpty(accessToken) && path.StartsWithSegments("/hubs"))
+                {
+                    logger.LogInformation("Setting token from query string for SignalR");
+                    context.Token = accessToken;
+                }
+                return Task.CompletedTask;
+            },
             OnAuthenticationFailed = context =>
             {
                 var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
@@ -253,6 +281,8 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseCors();
+app.UseWebSockets();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
@@ -981,16 +1011,12 @@ app.MapGet("/documents", async (
             d.UploadedAt))
         .ToListAsync();
 
-    return Results.Ok(new
+    return Results.Ok(new PaginatedResponse<DocumentSummaryDto>
     {
-        data = documents,
-        pagination = new
-        {
-            page,
-            pageSize,
-            totalCount,
-            totalPages = (int)Math.Ceiling(totalCount / (double)pageSize)
-        }
+        Items = documents,
+        TotalCount = totalCount,
+        Page = page,
+        PageSize = pageSize
     });
 })
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)

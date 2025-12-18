@@ -135,12 +135,80 @@ export function ChatPage() {
 
   // Actually send the pending auto-summary when ready
   useEffect(() => {
-    if (pendingAutoSummary && !isSending && !isLoadingMessages) {
-      const convId = pendingAutoSummary;
-      setPendingAutoSummary(null);
-      handleSendMessage(SUMMARY_PROMPT, convId);
-    }
-  }, [pendingAutoSummary, isSending, isLoadingMessages]);
+    if (!pendingAutoSummary || isSending || isLoadingMessages) return;
+
+    const convId = pendingAutoSummary;
+    setPendingAutoSummary(null);
+
+    // Directly send the auto-summary to avoid closure issues
+    const sendAutoSummary = async () => {
+      const userMessage: LocalMessage = {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: SUMMARY_PROMPT,
+      };
+      const assistantMessage: LocalMessage = {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        content: '',
+        isStreaming: true,
+      };
+
+      setMessages([userMessage, assistantMessage]);
+      setIsSending(true);
+
+      try {
+        await sendMessage(
+          convId,
+          SUMMARY_PROMPT,
+          (text) => {
+            setMessages((prev) => {
+              const lastIdx = prev.length - 1;
+              if (lastIdx < 0) return prev;
+              const lastMessage = prev[lastIdx];
+              if (lastMessage.role !== 'assistant') return prev;
+              return [
+                ...prev.slice(0, lastIdx),
+                { ...lastMessage, content: lastMessage.content + text }
+              ];
+            });
+          },
+          (messageId) => {
+            setMessages((prev) => {
+              const lastIdx = prev.length - 1;
+              if (lastIdx < 0) return prev;
+              const lastMessage = prev[lastIdx];
+              if (lastMessage.role !== 'assistant') return prev;
+              return [
+                ...prev.slice(0, lastIdx),
+                { ...lastMessage, id: messageId, isStreaming: false }
+              ];
+            });
+            loadConversations();
+          },
+          (error) => {
+            notify.error('Auto-summary failed', error);
+            setMessages((prev) => {
+              const lastIdx = prev.length - 1;
+              if (lastIdx < 0) return prev;
+              const lastMessage = prev[lastIdx];
+              if (lastMessage.role !== 'assistant') return prev;
+              return [
+                ...prev.slice(0, lastIdx),
+                { ...lastMessage, content: 'Sorry, an error occurred generating the summary.', isStreaming: false }
+              ];
+            });
+          }
+        );
+      } catch (error) {
+        console.error('Auto-summary error:', error);
+      } finally {
+        setIsSending(false);
+      }
+    };
+
+    sendAutoSummary();
+  }, [pendingAutoSummary, isSending, isLoadingMessages, loadConversations]);
 
   // Listen for document processing completion (for uploads from this page)
   useEffect(() => {

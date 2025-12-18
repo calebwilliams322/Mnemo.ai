@@ -371,16 +371,28 @@ export function ChatPage() {
         >
           <ArrowLeftIcon className="h-5 w-5" />
         </Link>
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 flex items-center gap-2">
           <h1 className="text-lg font-semibold text-gray-900 truncate">
             {currentConversation?.title || 'Chat'}
           </h1>
-          {currentConversation?.policyIds && currentConversation.policyIds.length > 0 && (
-            <p className="text-sm text-gray-500">
-              {currentConversation.policyIds.length} policy attached
-            </p>
-          )}
+          <button
+            onClick={() => {
+              setConversationName(currentConversation?.title || '');
+              setShowNamingBanner(true);
+            }}
+            className="p-1 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded transition-colors"
+            title="Rename conversation"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+            </svg>
+          </button>
         </div>
+        {currentConversation?.policyIds && currentConversation.policyIds.length > 0 && (
+          <p className="text-sm text-gray-500">
+            {currentConversation.policyIds.length} policy attached
+          </p>
+        )}
       </div>
 
       {/* Chat Area */}

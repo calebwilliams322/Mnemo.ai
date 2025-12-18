@@ -8,7 +8,7 @@ import {
 import { clsx } from 'clsx';
 
 const navigation = [
-  { name: 'Dashboard', href: '/', icon: HomeIcon },
+  { name: 'Dashboard', href: '/dashboard', icon: HomeIcon },
   { name: 'Documents', href: '/documents', icon: DocumentTextIcon },
   { name: 'Policies', href: '/policies', icon: ShieldCheckIcon },
   { name: 'Chat', href: '/chat', icon: ChatBubbleLeftRightIcon },

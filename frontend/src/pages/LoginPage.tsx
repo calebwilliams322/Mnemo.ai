@@ -30,7 +30,7 @@ export function LoginPage() {
     try {
       setError(null);
       await login(data.email, data.password);
-      navigate('/');
+      navigate('/dashboard');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');
     }

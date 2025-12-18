@@ -13,6 +13,7 @@ import { PoliciesPage } from './pages/PoliciesPage';
 import { PolicyDetailPage } from './pages/PolicyDetailPage';
 import { PolicySummaryPage } from './pages/PolicySummaryPage';
 import { ChatPage } from './pages/ChatPage';
+import { LandingPage } from './pages/LandingPage';
 
 // Protected Route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -38,7 +39,7 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
   }
 
   if (isAuthenticated) {
-    return <Navigate to="/" replace />;
+    return <Navigate to="/dashboard" replace />;
   }
 
   return <>{children}</>;
@@ -58,7 +59,11 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Public routes */}
+        {/* Public landing page */}
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/about" element={<LandingPage skipAuthRedirect />} />
+
+        {/* Auth pages */}
         <Route
           path="/login"
           element={
@@ -84,7 +89,7 @@ function App() {
             </ProtectedRoute>
           }
         >
-          <Route path="/" element={<DashboardPage />} />
+          <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/documents" element={<DocumentsPage />} />
           <Route path="/policies" element={<PoliciesPage />} />
           <Route path="/policies/:id" element={<PolicyDetailPage />} />

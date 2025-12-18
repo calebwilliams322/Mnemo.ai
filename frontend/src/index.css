@@ -26,3 +26,19 @@ body {
 #root {
   height: 100%;
 }
+
+/* Landing page styles */
+.mesh-gradient {
+  background-color: #fafafa;
+  background-image:
+    radial-gradient(at 0% 0%, hsla(210, 100%, 93%, 1) 0, transparent 50%),
+    radial-gradient(at 50% 0%, hsla(220, 100%, 95%, 1) 0, transparent 50%),
+    radial-gradient(at 100% 0%, hsla(200, 100%, 93%, 1) 0, transparent 50%);
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}

@@ -19,13 +19,19 @@ export function Navbar() {
     <nav className="bg-white border-b border-gray-200 px-4 py-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <Link to="/" className="text-xl font-bold text-primary-600">
+          <Link to="/dashboard" className="text-xl font-bold text-primary-600">
             Mnemo.ai
           </Link>
           <span className="text-sm text-gray-500">{user?.tenantName}</span>
         </div>
 
         <div className="flex items-center gap-4">
+          <Link
+            to="/about"
+            className="text-sm font-medium text-gray-600 hover:text-primary-600 transition-colors"
+          >
+            About
+          </Link>
           <Menu as="div" className="relative">
             <MenuButton className="flex items-center gap-2 text-sm text-gray-700 hover:text-gray-900">
               <UserCircleIcon className="h-8 w-8 text-gray-400" />

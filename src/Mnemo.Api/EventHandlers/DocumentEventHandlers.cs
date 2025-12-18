@@ -116,7 +116,11 @@ public class DocumentProcessedEventHandler : IEventHandler<DocumentProcessedEven
             documentId = domainEvent.DocumentId,
             status = domainEvent.Success ? "completed" : "failed",
             error = domainEvent.Error,
-            completedAt = domainEvent.OccurredAt
+            completedAt = domainEvent.OccurredAt,
+            policyId = domainEvent.PolicyId,
+            policyNumber = domainEvent.PolicyNumber,
+            coverageCount = domainEvent.CoverageCount,
+            confidence = domainEvent.Confidence
         };
 
         await Task.WhenAll(

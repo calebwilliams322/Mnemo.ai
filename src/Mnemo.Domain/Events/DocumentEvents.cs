@@ -27,6 +27,10 @@ public record DocumentProcessedEvent : DomainEventBase
     public required Guid DocumentId { get; init; }
     public required bool Success { get; init; }
     public string? Error { get; init; }
+    public Guid? PolicyId { get; init; }
+    public string? PolicyNumber { get; init; }
+    public int CoverageCount { get; init; }
+    public double? Confidence { get; init; }
 }
 
 /// <summary>

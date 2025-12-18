@@ -161,13 +161,34 @@ public class DocumentProcessingService : IDocumentProcessingService
                 await _dbContext.SaveChangesAsync();
             }
 
+            // Fetch policy details for the event if extraction succeeded
+            string? policyNumber = null;
+            int coverageCount = 0;
+            double? confidence = null;
+            if (policyId.HasValue)
+            {
+                var policy = await _dbContext.Policies
+                    .Include(p => p.Coverages)
+                    .FirstOrDefaultAsync(p => p.Id == policyId.Value);
+                if (policy != null)
+                {
+                    policyNumber = policy.PolicyNumber;
+                    coverageCount = policy.Coverages?.Count ?? 0;
+                    confidence = (double?)policy.ExtractionConfidence;
+                }
+            }
+
             // Publish success event
             await _eventPublisher.PublishAsync(new DocumentProcessedEvent
             {
                 DocumentId = documentId,
                 TenantId = tenantId,
                 Success = policyId.HasValue,
-                Error = policyId.HasValue ? null : "Structured extraction failed"
+                Error = policyId.HasValue ? null : "Structured extraction failed",
+                PolicyId = policyId,
+                PolicyNumber = policyNumber,
+                CoverageCount = coverageCount,
+                Confidence = confidence
             });
 
             _logger.LogInformation(

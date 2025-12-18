@@ -22,6 +22,17 @@ public record CreateConversationRequest
 }
 
 /// <summary>
+/// Request to update a conversation (e.g., rename).
+/// </summary>
+public record UpdateConversationRequest
+{
+    /// <summary>
+    /// New title for the conversation.
+    /// </summary>
+    public string? Title { get; init; }
+}
+
+/// <summary>
 /// Request to send a message in a conversation.
 /// </summary>
 public record SendMessageRequest

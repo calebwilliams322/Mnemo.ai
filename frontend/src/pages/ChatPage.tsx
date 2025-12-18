@@ -11,6 +11,7 @@ import {
   createConversation,
   deleteConversation,
   sendMessage,
+  updateConversation,
 } from '../api/conversations';
 import { useDocumentStore } from '../stores/documentStore';
 import { onProcessingComplete, offProcessingComplete } from '../lib/signalr';
@@ -49,6 +50,11 @@ export function ChatPage() {
   const [isLoadingConversations, setIsLoadingConversations] = useState(true);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [isSending, setIsSending] = useState(false);
+
+  // Naming banner state
+  const [showNamingBanner, setShowNamingBanner] = useState(false);
+  const [conversationName, setConversationName] = useState('');
+  const [isSavingName, setIsSavingName] = useState(false);
 
   const { uploadingFiles } = useDocumentStore();
   const autoSummary = searchParams.get('autoSummary') === 'true';
@@ -116,10 +122,13 @@ export function ChatPage() {
       autoSummaryTriggered.current = true;
       // Clear the query param
       setSearchParams({}, { replace: true });
+      // Show the naming banner with default title
+      setConversationName(currentConversation?.title || '');
+      setShowNamingBanner(true);
       // Trigger the summary
       handleSendMessage(SUMMARY_PROMPT);
     }
-  }, [autoSummary, id, messages.length, isLoadingMessages, isSending]);
+  }, [autoSummary, id, messages.length, isLoadingMessages, isSending, currentConversation?.title]);
 
   // Listen for document processing completion (for uploads from this page)
   useEffect(() => {
@@ -238,6 +247,28 @@ export function ChatPage() {
       setIsSending(false);
       abortControllerRef.current = null;
     }
+  };
+
+  const handleSaveName = async () => {
+    if (!id || !conversationName.trim()) return;
+
+    setIsSavingName(true);
+    try {
+      await updateConversation(id, { title: conversationName.trim() });
+      setCurrentConversation((prev) => prev ? { ...prev, title: conversationName.trim() } : null);
+      setShowNamingBanner(false);
+      notify.success('Conversation renamed');
+      loadConversations(); // Refresh the list
+    } catch (error) {
+      console.error('Failed to rename conversation:', error);
+      notify.error('Failed to rename conversation');
+    } finally {
+      setIsSavingName(false);
+    }
+  };
+
+  const handleSkipNaming = () => {
+    setShowNamingBanner(false);
   };
 
   // LIST VIEW - When no conversation is selected
@@ -360,6 +391,49 @@ export function ChatPage() {
           </div>
         ) : (
           <>
+            {/* Naming Banner */}
+            {showNamingBanner && (
+              <div className="bg-primary-50 border-b border-primary-200 p-4">
+                <div className="flex items-center gap-3">
+                  <div className="flex-shrink-0">
+                    <svg className="h-5 w-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                    </svg>
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-primary-900 mb-2">Name this conversation</p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={conversationName}
+                        onChange={(e) => setConversationName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleSaveName();
+                          if (e.key === 'Escape') handleSkipNaming();
+                        }}
+                        placeholder="e.g., Gray Duck Auto Policy Review"
+                        className="flex-1 px-3 py-1.5 text-sm border border-primary-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        autoFocus
+                      />
+                      <button
+                        onClick={handleSaveName}
+                        disabled={isSavingName || !conversationName.trim()}
+                        className="px-3 py-1.5 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isSavingName ? 'Saving...' : 'Save'}
+                      </button>
+                      <button
+                        onClick={handleSkipNaming}
+                        className="px-3 py-1.5 text-sm font-medium text-gray-600 hover:text-gray-900"
+                      >
+                        Skip
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-6 space-y-4">
               {messages.length === 0 ? (

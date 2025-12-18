@@ -31,6 +31,11 @@ export async function deleteConversation(id: string): Promise<void> {
   await apiClient.delete(`/conversations/${id}`);
 }
 
+// PATCH /conversations/{id}
+export async function updateConversation(id: string, data: { title?: string }): Promise<void> {
+  await apiClient.patch(`/conversations/${id}`, data);
+}
+
 // POST /conversations/{id}/messages (SSE streaming)
 export async function sendMessage(
   conversationId: string,

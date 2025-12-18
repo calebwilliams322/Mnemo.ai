@@ -484,6 +484,29 @@ public partial class ChatService : IChatService
         return true;
     }
 
+    public async Task<bool> UpdateConversationAsync(
+        Guid conversationId,
+        UpdateConversationRequest request,
+        CancellationToken ct = default)
+    {
+        var conversation = await _dbContext.Conversations
+            .FirstOrDefaultAsync(c => c.Id == conversationId && c.UserId == _currentUser.UserId, ct);
+
+        if (conversation == null)
+            return false;
+
+        if (request.Title != null)
+        {
+            conversation.Title = request.Title;
+        }
+
+        conversation.UpdatedAt = DateTime.UtcNow;
+        await _dbContext.SaveChangesAsync(ct);
+
+        _logger.LogInformation("Updated conversation {ConversationId}", conversationId);
+        return true;
+    }
+
     /// <summary>
     /// Extract citations from Claude's response by matching page references.
     /// </summary>

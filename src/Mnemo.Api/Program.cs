@@ -1852,6 +1852,23 @@ app.MapDelete("/conversations/{id:guid}", async (
 .WithTags("Chat")
 .RequireRateLimiting("api");
 
+// PATCH /conversations/{id} - Update conversation (rename)
+app.MapPatch("/conversations/{id:guid}", async (
+    Guid id,
+    UpdateConversationRequest request,
+    IChatService chatService) =>
+{
+    var updated = await chatService.UpdateConversationAsync(id, request);
+    if (!updated)
+        return Results.NotFound("Conversation not found");
+
+    return Results.NoContent();
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("UpdateConversation")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
 app.Run();
 
 // Make Program accessible for integration tests

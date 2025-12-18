@@ -41,6 +41,14 @@ public interface IChatService
     Task<bool> DeleteConversationAsync(
         Guid conversationId,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Update a conversation (e.g., rename).
+    /// </summary>
+    Task<bool> UpdateConversationAsync(
+        Guid conversationId,
+        UpdateConversationRequest request,
+        CancellationToken ct = default);
 }
 
 /// <summary>

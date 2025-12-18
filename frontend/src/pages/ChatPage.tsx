@@ -125,8 +125,10 @@ export function ChatPage() {
       // Show the naming banner with default title
       setConversationName(currentConversation?.title || '');
       setShowNamingBanner(true);
-      // Trigger the summary
-      handleSendMessage(SUMMARY_PROMPT);
+      // Trigger the summary - pass id directly to avoid closure issues
+      setTimeout(() => {
+        handleSendMessage(SUMMARY_PROMPT, id);
+      }, 100);
     }
   }, [autoSummary, id, messages.length, isLoadingMessages, isSending, currentConversation?.title]);
 
@@ -174,8 +176,9 @@ export function ChatPage() {
     }
   };
 
-  const handleSendMessage = async (content: string) => {
-    if (!id || isSending) return;
+  const handleSendMessage = async (content: string, conversationId?: string) => {
+    const targetId = conversationId || id;
+    if (!targetId || isSending) return;
 
     const userMessage: LocalMessage = {
       id: `user-${Date.now()}`,
@@ -197,7 +200,7 @@ export function ChatPage() {
 
     try {
       await sendMessage(
-        id,
+        targetId,
         content,
         (text) => {
           setMessages((prev) => {

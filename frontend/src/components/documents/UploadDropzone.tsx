@@ -1,10 +1,11 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import { CloudArrowUpIcon, DocumentIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { clsx } from 'clsx';
 import { uploadDocument } from '../../api/documents';
 import { useDocumentStore } from '../../stores/documentStore';
 import { notify } from '../../stores/notificationStore';
-import { joinDocumentGroup } from '../../lib/signalr';
+import { joinDocumentGroup, onProcessingComplete, offProcessingComplete } from '../../lib/signalr';
+import type { ProcessingCompleteEvent } from '../../api/types';
 
 interface UploadDropzoneProps {
   onUploadComplete?: () => void;
@@ -12,7 +13,33 @@ interface UploadDropzoneProps {
 
 export function UploadDropzone({ onUploadComplete }: UploadDropzoneProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const { uploadingFiles, addUploadingFile, updateUploadProgress, setUploadComplete, setUploadError, removeUploadingFile } = useDocumentStore();
+  const { uploadingFiles, addUploadingFile, updateUploadProgress, setUploadComplete, setUploadError, removeUploadingFile, setProcessingComplete } = useDocumentStore();
+
+  // Listen for SignalR processing complete events
+  useEffect(() => {
+    const handleProcessingComplete = (event: ProcessingCompleteEvent) => {
+      console.log('Processing complete event received:', event);
+      setProcessingComplete(event);
+
+      // Find the matching upload and show notification
+      for (const [, upload] of uploadingFiles.entries()) {
+        if (upload.documentId === event.documentId) {
+          if (event.status === 'completed') {
+            notify.success('Processing complete', `${upload.file.name} is ready`);
+          } else if (event.status === 'failed') {
+            notify.error('Processing failed', upload.file.name);
+          }
+          break;
+        }
+      }
+    };
+
+    onProcessingComplete(handleProcessingComplete);
+
+    return () => {
+      offProcessingComplete(handleProcessingComplete);
+    };
+  }, [uploadingFiles, setProcessingComplete]);
 
   const handleFiles = useCallback(async (files: FileList | null) => {
     if (!files) return;

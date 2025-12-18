@@ -11,6 +11,7 @@ import { DashboardPage } from './pages/DashboardPage';
 import { DocumentsPage } from './pages/DocumentsPage';
 import { PoliciesPage } from './pages/PoliciesPage';
 import { PolicyDetailPage } from './pages/PolicyDetailPage';
+import { PolicySummaryPage } from './pages/PolicySummaryPage';
 import { ChatPage } from './pages/ChatPage';
 
 // Protected Route wrapper
@@ -87,6 +88,7 @@ function App() {
           <Route path="/documents" element={<DocumentsPage />} />
           <Route path="/policies" element={<PoliciesPage />} />
           <Route path="/policies/:id" element={<PolicyDetailPage />} />
+          <Route path="/policy-summary" element={<PolicySummaryPage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/chat/:id" element={<ChatPage />} />
         </Route>

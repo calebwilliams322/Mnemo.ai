@@ -21,7 +21,7 @@ export function MessageBubble({ role, content, isStreaming }: MessageBubbleProps
         {isUser ? (
           <UserCircleIcon className="h-6 w-6 text-white" />
         ) : (
-          <span className="text-sm font-semibold text-primary-700">Mnemo</span>
+          <span className="text-sm font-semibold text-primary-700">Mnemo.ai</span>
         )}
       </div>
 

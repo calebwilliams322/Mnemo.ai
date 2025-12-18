@@ -20,7 +20,7 @@ export function Navbar() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Link to="/" className="text-xl font-bold text-primary-600">
-            Mnemo
+            Mnemo.ai
           </Link>
           <span className="text-sm text-gray-500">{user?.tenantName}</span>
         </div>

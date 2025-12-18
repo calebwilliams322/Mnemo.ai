@@ -1,30 +1,25 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { DocumentTextIcon, ShieldCheckIcon, ChatBubbleLeftRightIcon } from '@heroicons/react/24/outline';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/common';
-import { UploadDropzone } from '../components/documents/UploadDropzone';
+import { Card } from '../components/common';
+import { QuickActions } from '../components/dashboard/QuickActions';
 import { getDocuments } from '../api/documents';
 import { getPolicies } from '../api/policies';
-import { getConversations } from '../api/conversations';
-import type { DocumentSummary, PolicyListItem, ConversationSummary } from '../api/types';
+import type { DocumentSummary, PolicyListItem } from '../api/types';
 import { format } from 'date-fns';
 
 export function DashboardPage() {
   const [recentDocuments, setRecentDocuments] = useState<DocumentSummary[]>([]);
   const [recentPolicies, setRecentPolicies] = useState<PolicyListItem[]>([]);
-  const [recentConversations, setRecentConversations] = useState<ConversationSummary[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
   const loadData = async () => {
     try {
-      const [docsResponse, policiesResponse, conversationsResponse] = await Promise.all([
+      const [docsResponse, policiesResponse] = await Promise.all([
         getDocuments({ pageSize: 5 }),
         getPolicies({ pageSize: 5 }),
-        getConversations(),
       ]);
       setRecentDocuments(docsResponse?.items || []);
       setRecentPolicies(policiesResponse?.items || []);
-      setRecentConversations(conversationsResponse?.slice(0, 5) || []);
     } catch (error) {
       console.error('Failed to load dashboard data:', error);
     } finally {
@@ -53,69 +48,11 @@ export function DashboardPage() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
-        <p className="text-gray-600">Upload documents and manage your insurance policies</p>
+        <p className="text-gray-600">Analyze and manage your insurance policies</p>
       </div>
 
-      {/* Upload Section */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Upload Documents</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <UploadDropzone onUploadComplete={loadData} />
-        </CardContent>
-      </Card>
-
-      {/* Quick Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Link to="/documents" className="block">
-          <Card className="hover:border-primary-300 transition-colors">
-            <div className="flex items-center gap-4 p-4">
-              <div className="bg-blue-100 p-3 rounded-lg">
-                <DocumentTextIcon className="h-6 w-6 text-blue-600" />
-              </div>
-              <div>
-                <p className="text-sm text-gray-500">Documents</p>
-                <p className="text-2xl font-semibold text-gray-900">
-                  {recentDocuments?.length || 0}
-                </p>
-              </div>
-            </div>
-          </Card>
-        </Link>
-
-        <Link to="/policies" className="block">
-          <Card className="hover:border-primary-300 transition-colors">
-            <div className="flex items-center gap-4 p-4">
-              <div className="bg-green-100 p-3 rounded-lg">
-                <ShieldCheckIcon className="h-6 w-6 text-green-600" />
-              </div>
-              <div>
-                <p className="text-sm text-gray-500">Policies</p>
-                <p className="text-2xl font-semibold text-gray-900">
-                  {recentPolicies?.length || 0}
-                </p>
-              </div>
-            </div>
-          </Card>
-        </Link>
-
-        <Link to="/chat" className="block">
-          <Card className="hover:border-primary-300 transition-colors">
-            <div className="flex items-center gap-4 p-4">
-              <div className="bg-purple-100 p-3 rounded-lg">
-                <ChatBubbleLeftRightIcon className="h-6 w-6 text-purple-600" />
-              </div>
-              <div>
-                <p className="text-sm text-gray-500">Conversations</p>
-                <p className="text-2xl font-semibold text-gray-900">
-                  {recentConversations?.length || 0}
-                </p>
-              </div>
-            </div>
-          </Card>
-        </Link>
-      </div>
+      {/* Quick Actions */}
+      <QuickActions />
 
       {/* Recent Items */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

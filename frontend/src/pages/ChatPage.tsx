@@ -56,6 +56,9 @@ export function ChatPage() {
   const [conversationName, setConversationName] = useState('');
   const [isSavingName, setIsSavingName] = useState(false);
 
+  // Auto-summary state
+  const [pendingAutoSummary, setPendingAutoSummary] = useState<string | null>(null);
+
   const { uploadingFiles } = useDocumentStore();
   const autoSummary = searchParams.get('autoSummary') === 'true';
 
@@ -116,21 +119,28 @@ export function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Handle auto-summary trigger
+  // Handle auto-summary trigger - set up the pending summary
   useEffect(() => {
-    if (autoSummary && id && !autoSummaryTriggered.current && messages.length === 0 && !isLoadingMessages && !isSending) {
+    if (autoSummary && id && !autoSummaryTriggered.current && messages.length === 0 && !isLoadingMessages) {
       autoSummaryTriggered.current = true;
       // Clear the query param
       setSearchParams({}, { replace: true });
       // Show the naming banner with default title
       setConversationName(currentConversation?.title || '');
       setShowNamingBanner(true);
-      // Trigger the summary - pass id directly to avoid closure issues
-      setTimeout(() => {
-        handleSendMessage(SUMMARY_PROMPT, id);
-      }, 100);
+      // Queue the auto-summary to be sent
+      setPendingAutoSummary(id);
     }
-  }, [autoSummary, id, messages.length, isLoadingMessages, isSending, currentConversation?.title]);
+  }, [autoSummary, id, messages.length, isLoadingMessages, currentConversation?.title, setSearchParams]);
+
+  // Actually send the pending auto-summary when ready
+  useEffect(() => {
+    if (pendingAutoSummary && !isSending && !isLoadingMessages) {
+      const convId = pendingAutoSummary;
+      setPendingAutoSummary(null);
+      handleSendMessage(SUMMARY_PROMPT, convId);
+    }
+  }, [pendingAutoSummary, isSending, isLoadingMessages]);
 
   // Listen for document processing completion (for uploads from this page)
   useEffect(() => {

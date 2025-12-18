@@ -15,13 +15,13 @@ export function MessageBubble({ role, content, isStreaming }: MessageBubbleProps
     <div className={clsx('flex gap-3', isUser && 'flex-row-reverse')}>
       {/* Avatar */}
       <div className={clsx(
-        'flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center',
-        isUser ? 'bg-primary-600' : 'bg-gray-200'
+        'flex-shrink-0 rounded-full flex items-center justify-center',
+        isUser ? 'w-8 h-8 bg-primary-600' : 'w-auto h-8 px-2 bg-primary-100'
       )}>
         {isUser ? (
           <UserCircleIcon className="h-6 w-6 text-white" />
         ) : (
-          <span className="text-sm font-semibold text-gray-600">AI</span>
+          <span className="text-sm font-semibold text-primary-700">Mnemo</span>
         )}
       </div>
 

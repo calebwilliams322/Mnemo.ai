@@ -59,11 +59,28 @@ public class ClaudeChatService : IClaudeChatService
         var outputTokens = 0;
 
         // StreamClaudeMessageAsync returns IAsyncEnumerable<MessageResponse>
-        // Each response contains Delta with Text for streamed content
+        // Only process Delta.Text for streaming - Content array may contain cumulative data
         await foreach (var response in _client.Messages.StreamClaudeMessageAsync(parameters, ct))
         {
-            // Check for text delta content
+            // Debug: Log what the SDK is returning
             if (response.Delta?.Text != null)
+            {
+                _logger.LogDebug("SDK Delta.Text: {Text}", response.Delta.Text);
+            }
+            if (response.Content?.Count > 0)
+            {
+                var contentTexts = response.Content
+                    .OfType<Anthropic.SDK.Messaging.TextContent>()
+                    .Select(c => c.Text)
+                    .ToList();
+                if (contentTexts.Any(t => !string.IsNullOrEmpty(t)))
+                {
+                    _logger.LogDebug("SDK Content array: {Texts}", string.Join("|", contentTexts));
+                }
+            }
+
+            // Only emit from Delta.Text - this should contain true deltas
+            if (response.Delta?.Text != null && !string.IsNullOrEmpty(response.Delta.Text))
             {
                 yield return new ChatStreamEvent
                 {

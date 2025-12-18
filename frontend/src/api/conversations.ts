@@ -83,6 +83,11 @@ export async function sendMessage(
       try {
         const event: ChatStreamEvent = JSON.parse(data);
 
+        // Debug: log raw tokens to identify duplication source
+        if (event.Type === 'token' && event.Text) {
+          console.log('[SSE Token]', JSON.stringify(event.Text));
+        }
+
         // IMPORTANT: Event properties are PascalCase from backend
         switch (event.Type) {
           case 'token':

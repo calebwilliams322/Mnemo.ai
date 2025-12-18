@@ -131,27 +131,33 @@ export function ChatPage() {
       await sendMessage(
         id,
         content,
-        // onToken
+        // onToken - properly create new object to avoid mutation issues
         (text) => {
           setMessages((prev) => {
-            const updated = [...prev];
-            const lastMessage = updated[updated.length - 1];
-            if (lastMessage.role === 'assistant') {
-              lastMessage.content += text;
-            }
-            return updated;
+            const lastIdx = prev.length - 1;
+            if (lastIdx < 0) return prev;
+            const lastMessage = prev[lastIdx];
+            if (lastMessage.role !== 'assistant') return prev;
+
+            // Create a new array with a new last message object
+            return [
+              ...prev.slice(0, lastIdx),
+              { ...lastMessage, content: lastMessage.content + text }
+            ];
           });
         },
         // onComplete
         (messageId) => {
           setMessages((prev) => {
-            const updated = [...prev];
-            const lastMessage = updated[updated.length - 1];
-            if (lastMessage.role === 'assistant') {
-              lastMessage.id = messageId;
-              lastMessage.isStreaming = false;
-            }
-            return updated;
+            const lastIdx = prev.length - 1;
+            if (lastIdx < 0) return prev;
+            const lastMessage = prev[lastIdx];
+            if (lastMessage.role !== 'assistant') return prev;
+
+            return [
+              ...prev.slice(0, lastIdx),
+              { ...lastMessage, id: messageId, isStreaming: false }
+            ];
           });
           loadConversations(); // Refresh to update last message
         },
@@ -159,13 +165,15 @@ export function ChatPage() {
         (error) => {
           notify.error('Chat error', error);
           setMessages((prev) => {
-            const updated = [...prev];
-            const lastMessage = updated[updated.length - 1];
-            if (lastMessage.role === 'assistant' && lastMessage.isStreaming) {
-              lastMessage.content = 'Sorry, an error occurred. Please try again.';
-              lastMessage.isStreaming = false;
-            }
-            return updated;
+            const lastIdx = prev.length - 1;
+            if (lastIdx < 0) return prev;
+            const lastMessage = prev[lastIdx];
+            if (lastMessage.role !== 'assistant' || !lastMessage.isStreaming) return prev;
+
+            return [
+              ...prev.slice(0, lastIdx),
+              { ...lastMessage, content: 'Sorry, an error occurred. Please try again.', isStreaming: false }
+            ];
           });
         },
         abortControllerRef.current.signal

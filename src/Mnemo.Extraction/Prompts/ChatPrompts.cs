@@ -4,6 +4,35 @@ using Mnemo.Application.Services;
 namespace Mnemo.Extraction.Prompts;
 
 /// <summary>
+/// Structured policy data for chat context.
+/// </summary>
+public record PolicyContextData
+{
+    public string? PolicyNumber { get; init; }
+    public string? CarrierName { get; init; }
+    public string? InsuredName { get; init; }
+    public string? PolicyStatus { get; init; }
+    public DateOnly? EffectiveDate { get; init; }
+    public DateOnly? ExpirationDate { get; init; }
+    public decimal? TotalPremium { get; init; }
+    public decimal? ExtractionConfidence { get; init; }
+    public List<CoverageContextData> Coverages { get; init; } = [];
+}
+
+/// <summary>
+/// Structured coverage data for chat context.
+/// </summary>
+public record CoverageContextData
+{
+    public string CoverageType { get; init; } = "";
+    public string? CoverageSubtype { get; init; }
+    public decimal? EachOccurrenceLimit { get; init; }
+    public decimal? AggregateLimit { get; init; }
+    public decimal? Deductible { get; init; }
+    public decimal? Premium { get; init; }
+}
+
+/// <summary>
 /// Prompts for RAG-powered insurance policy chat.
 /// </summary>
 public static class ChatPrompts
@@ -20,26 +49,33 @@ public static class ChatPrompts
         - Use plain language while maintaining accuracy
         - Be genuinely helpful - share your insurance expertise freely
 
+        ## Available Information
+        You have access to two types of policy information:
+        1. **Extracted Policy Data** - Structured, high-confidence data including limits, dates, carrier info, and coverages
+        2. **Policy Excerpts** - Raw text from policy documents for specific language and context
+
+        When answering questions:
+        - Use Extracted Policy Data for factual answers about limits, dates, premiums, and coverage details
+        - Reference Policy Excerpts for specific policy language, exclusions, conditions, and endorsements
+        - Cite page numbers when quoting document text
+
         ## Citation Format
         When referencing policy content, use this format: [Source: Page X]
         For section-specific references: [Source: Page X, Section: Y]
         Always include citations for factual claims about the user's specific coverage, limits, or exclusions.
 
-        ## Context
-        The user is asking about policies belonging to their account. Relevant excerpts
-        from their policy documents are provided below.
-
         ## Important Guidelines
-        1. Answer questions using both the policy excerpts AND your general insurance knowledge
-        2. When sharing industry context (typical limits, common practices, market norms), be helpful and informative
-        3. Don't make up specific details about the USER'S policy - cite documents for their specific coverage
-        4. Distinguish between what IS covered vs what is NOT covered in their policy
-        5. For their limits and deductibles, quote exact figures from the documents
-        6. If multiple policies are provided, be clear about which policy you're referencing
+        1. Prefer the Extracted Policy Data for coverage limits and deductibles - this data has been validated
+        2. Use Policy Excerpts to provide supporting context and specific policy language
+        3. Answer questions using both sources AND your general insurance knowledge
+        4. When sharing industry context (typical limits, common practices), be helpful and informative
+        5. Don't make up specific details about the USER'S policy - use the provided data
+        6. Distinguish between what IS covered vs what is NOT covered in their policy
+        7. If multiple policies are provided, be clear about which policy you're referencing
 
         ## Sharing Industry Knowledge
         You CAN and SHOULD:
-        - Share typical coverage ranges for different policy types (e.g., "commercial auto policies commonly have $500K-$2M limits")
+        - Share typical coverage ranges for different policy types
         - Explain industry terminology and common practices
         - Provide context about what coverage levels are typical for similar businesses
         - Discuss general pros/cons of different coverage options
@@ -59,8 +95,79 @@ public static class ChatPrompts
         IEnumerable<ChunkSearchResult> chunks,
         string userQuery)
     {
+        return BuildContextPrompt(chunks, null, userQuery);
+    }
+
+    /// <summary>
+    /// Build the context prompt with structured policy data, relevant chunks, and user query.
+    /// </summary>
+    public static string BuildContextPrompt(
+        IEnumerable<ChunkSearchResult> chunks,
+        List<PolicyContextData>? policies,
+        string userQuery)
+    {
         var sb = new StringBuilder();
 
+        // Add structured policy data first (authoritative source)
+        if (policies?.Count > 0)
+        {
+            sb.AppendLine("## Extracted Policy Data");
+            sb.AppendLine();
+
+            foreach (var policy in policies)
+            {
+                sb.AppendLine($"### Policy: {policy.PolicyNumber ?? "Unknown"}");
+                if (!string.IsNullOrEmpty(policy.CarrierName))
+                    sb.AppendLine($"- **Carrier:** {policy.CarrierName}");
+                if (!string.IsNullOrEmpty(policy.InsuredName))
+                    sb.AppendLine($"- **Named Insured:** {policy.InsuredName}");
+                if (!string.IsNullOrEmpty(policy.PolicyStatus))
+                    sb.AppendLine($"- **Status:** {FormatPolicyStatus(policy.PolicyStatus)}");
+                if (policy.EffectiveDate.HasValue || policy.ExpirationDate.HasValue)
+                    sb.AppendLine($"- **Policy Period:** {policy.EffectiveDate?.ToString("MM/dd/yyyy") ?? "N/A"} to {policy.ExpirationDate?.ToString("MM/dd/yyyy") ?? "N/A"}");
+                if (policy.TotalPremium.HasValue)
+                    sb.AppendLine($"- **Total Premium:** ${policy.TotalPremium:N2}");
+                if (policy.ExtractionConfidence.HasValue)
+                    sb.AppendLine($"- **Data Confidence:** {policy.ExtractionConfidence:P0}");
+
+                if (policy.Coverages.Count > 0)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("**Coverages:**");
+                    sb.AppendLine();
+                    sb.AppendLine("| Coverage Type | Each Occurrence | Aggregate | Deductible | Premium |");
+                    sb.AppendLine("|---------------|-----------------|-----------|------------|---------|");
+
+                    foreach (var coverage in policy.Coverages)
+                    {
+                        var coverageType = !string.IsNullOrEmpty(coverage.CoverageSubtype)
+                            ? $"{coverage.CoverageType} ({coverage.CoverageSubtype})"
+                            : coverage.CoverageType;
+                        var eachOccurrence = coverage.EachOccurrenceLimit.HasValue
+                            ? $"${coverage.EachOccurrenceLimit:N0}"
+                            : "N/A";
+                        var aggregate = coverage.AggregateLimit.HasValue
+                            ? $"${coverage.AggregateLimit:N0}"
+                            : "N/A";
+                        var deductible = coverage.Deductible.HasValue
+                            ? $"${coverage.Deductible:N0}"
+                            : "N/A";
+                        var premium = coverage.Premium.HasValue
+                            ? $"${coverage.Premium:N0}"
+                            : "N/A";
+
+                        sb.AppendLine($"| {coverageType} | {eachOccurrence} | {aggregate} | {deductible} | {premium} |");
+                    }
+                }
+
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("---");
+            sb.AppendLine();
+        }
+
+        // Add RAG chunks (supporting context)
         sb.AppendLine("## Policy Excerpts");
         sb.AppendLine();
 
@@ -99,6 +206,22 @@ public static class ChatPrompts
         sb.AppendLine(userQuery);
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Format policy status for display.
+    /// </summary>
+    private static string FormatPolicyStatus(string status)
+    {
+        return status.ToLower() switch
+        {
+            "quote" => "Quote",
+            "bound" => "Bound",
+            "active" => "Active",
+            "expired" => "Expired",
+            "cancelled" => "Cancelled",
+            _ => status
+        };
     }
 
     /// <summary>

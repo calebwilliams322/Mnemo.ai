@@ -186,6 +186,53 @@ public partial class ChatService : IChatService
         var searchFailed = false;
         string? embeddingError = null;
 
+        // Parse policy and document IDs from conversation (needed for both RAG and policy context)
+        var policyIds = ParseGuidArray(conversation.PolicyIds);
+        var documentIds = ParseGuidArray(conversation.DocumentIds);
+
+        // 4a. Load structured policy data for context (always include, regardless of RAG)
+        List<PolicyContextData> policyContext = [];
+        if (policyIds.Count > 0)
+        {
+            try
+            {
+                policyContext = await _dbContext.Policies
+                    .Where(p => policyIds.Contains(p.Id))
+                    .Include(p => p.Coverages)
+                    .AsNoTracking()
+                    .Select(p => new PolicyContextData
+                    {
+                        PolicyNumber = p.PolicyNumber,
+                        CarrierName = p.CarrierName,
+                        InsuredName = p.InsuredName,
+                        PolicyStatus = p.PolicyStatus,
+                        EffectiveDate = p.EffectiveDate,
+                        ExpirationDate = p.ExpirationDate,
+                        TotalPremium = p.TotalPremium,
+                        ExtractionConfidence = p.ExtractionConfidence,
+                        Coverages = p.Coverages.Select(c => new CoverageContextData
+                        {
+                            CoverageType = c.CoverageType,
+                            CoverageSubtype = c.CoverageSubtype,
+                            EachOccurrenceLimit = c.EachOccurrenceLimit,
+                            AggregateLimit = c.AggregateLimit,
+                            Deductible = c.Deductible,
+                            Premium = c.Premium
+                        }).ToList()
+                    })
+                    .ToListAsync(ct);
+
+                _logger.LogInformation(
+                    "Loaded {PolicyCount} policies with {CoverageCount} total coverages for context",
+                    policyContext.Count,
+                    policyContext.Sum(p => p.Coverages.Count));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to load policy context, continuing without structured data");
+            }
+        }
+
         if (performRag)
         {
             // 5. Embed user query (with timeout)
@@ -236,9 +283,6 @@ public partial class ChatService : IChatService
             }
 
             // 6. Semantic search for relevant chunks (with timeout + graceful degradation)
-            var policyIds = ParseGuidArray(conversation.PolicyIds);
-            var documentIds = ParseGuidArray(conversation.DocumentIds);
-
             var searchRequest = new SemanticSearchRequest
             {
                 QueryEmbedding = queryEmbedding!,
@@ -291,9 +335,9 @@ public partial class ChatService : IChatService
         // Use pre-captured history (before new message was added)
         var chatMessages = new List<ChatMessage>(historyMessages);
 
-        // 8. Build the current user message with RAG context (if applicable)
-        var currentUserContent = relevantChunks.Count > 0
-            ? ChatPrompts.BuildContextPrompt(relevantChunks, userMessage)
+        // 8. Build the current user message with RAG context and structured policy data
+        var currentUserContent = relevantChunks.Count > 0 || policyContext.Count > 0
+            ? ChatPrompts.BuildContextPrompt(relevantChunks, policyContext, userMessage)
             : searchFailed
                 ? $"[Note: Document search is temporarily unavailable. Please answer based on general knowledge about insurance policies.]\n\n{userMessage}"
                 : userMessage;

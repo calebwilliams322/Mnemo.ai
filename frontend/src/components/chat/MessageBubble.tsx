@@ -1,6 +1,10 @@
+import { useMemo } from 'react';
 import { UserCircleIcon } from '@heroicons/react/24/solid';
 import { clsx } from 'clsx';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
+import { markdownComponents } from './MarkdownComponents';
 
 interface MessageBubbleProps {
   role: 'user' | 'assistant';
@@ -10,6 +14,10 @@ interface MessageBubbleProps {
 
 export function MessageBubble({ role, content, isStreaming }: MessageBubbleProps) {
   const isUser = role === 'user';
+
+  // Memoize plugins to prevent unnecessary re-renders
+  const remarkPlugins = useMemo(() => [remarkGfm], []);
+  const rehypePlugins = useMemo(() => [rehypeHighlight], []);
 
   return (
     <div className={clsx('flex gap-3', isUser && 'flex-row-reverse')}>
@@ -27,21 +35,27 @@ export function MessageBubble({ role, content, isStreaming }: MessageBubbleProps
 
       {/* Message */}
       <div className={clsx(
-        'max-w-[70%] rounded-2xl px-4 py-3',
+        'rounded-2xl px-4 py-3',
         isUser
-          ? 'bg-primary-600 text-white'
-          : 'bg-gray-100 text-gray-900'
+          ? 'max-w-[70%] bg-primary-600 text-white'
+          : 'max-w-[85%] bg-white border border-gray-200 shadow-sm text-gray-900'
       )}>
-        <div className="text-sm prose prose-sm max-w-none">
-          {isUser ? (
-            content
-          ) : (
-            <ReactMarkdown>{content}</ReactMarkdown>
-          )}
-          {isStreaming && (
-            <span className="inline-block w-2 h-4 bg-current ml-1 animate-pulse" />
-          )}
-        </div>
+        {isUser ? (
+          <div className="text-sm whitespace-pre-wrap">{content}</div>
+        ) : (
+          <div className="chat-prose">
+            <ReactMarkdown
+              remarkPlugins={remarkPlugins}
+              rehypePlugins={rehypePlugins}
+              components={markdownComponents}
+            >
+              {content}
+            </ReactMarkdown>
+            {isStreaming && (
+              <span className="inline-block w-2 h-4 bg-primary-500 ml-1 animate-pulse rounded-sm" />
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

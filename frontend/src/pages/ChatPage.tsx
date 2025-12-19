@@ -5,6 +5,7 @@ import { Card, CardHeader, CardTitle, CardContent, LoadingSpinner } from '../com
 import { UploadDropzone } from '../components/documents/UploadDropzone';
 import { MessageBubble } from '../components/chat/MessageBubble';
 import { ChatInput } from '../components/chat/ChatInput';
+import { ChatQuickActions, QUICK_ACTION_PROMPTS } from '../components/chat/ChatQuickActions';
 import {
   getConversations,
   getConversation,
@@ -532,17 +533,27 @@ export function ChatPage() {
                   <p>No messages yet. Start the conversation!</p>
                 </div>
               ) : (
-                messages.map((message) => (
-                  <MessageBubble
-                    key={message.id}
-                    role={message.role}
-                    content={message.content}
-                    isStreaming={message.isStreaming}
-                  />
-                ))
+                messages
+                  .filter((m) => m.role !== 'user' || (m.content !== SUMMARY_PROMPT && !QUICK_ACTION_PROMPTS.has(m.content)))
+                  .map((message) => (
+                    <MessageBubble
+                      key={message.id}
+                      role={message.role}
+                      content={message.content}
+                      isStreaming={message.isStreaming}
+                    />
+                  ))
               )}
               <div ref={messagesEndRef} />
             </div>
+
+            {/* Quick Actions - only show when policy is loaded */}
+            {currentConversation?.policyIds && currentConversation.policyIds.length > 0 && (
+              <ChatQuickActions
+                onAction={handleSendMessage}
+                disabled={isSending}
+              />
+            )}
 
             {/* Input */}
             <ChatInput

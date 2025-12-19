@@ -120,18 +120,13 @@ public class ExtractionPipeline : IExtractionPipeline
                 document.DocumentType = result.DocumentType;
             }
 
-            // Step 5: Map to Policy entity (from old_src)
+            // Step 5: Map to Policy entity (minimal extraction - no coverages)
             var policy = CreatePolicyFromExtraction(tenantId, documentId, result);
             _dbContext.Policies.Add(policy);
 
-            // Step 6: Create coverages (from old_src)
-            foreach (var coverageResult in result.Coverages)
-            {
-                var coverage = CreateCoverageFromExtraction(policy.Id, coverageResult);
-                _dbContext.Coverages.Add(coverage);
-            }
+            // Note: Coverages not extracted in minimal mode - RAG handles coverage queries in chat
 
-            // Step 7: Set status based on confidence
+            // Step 6: Set status based on confidence
             if (result.ConfidenceScore < 0.7)
             {
                 document.ProcessingStatus = "needs_review";
@@ -140,22 +135,22 @@ public class ExtractionPipeline : IExtractionPipeline
                     documentId, result.ConfidenceScore);
             }
 
-            // Step 8: Save everything
+            // Step 7: Save everything
             await _dbContext.SaveChangesAsync(ct);
 
-            // Step 9: Publish completion event
+            // Step 8: Publish completion event
             await _eventPublisher.PublishAsync(new ExtractionCompletedEvent
             {
                 DocumentId = documentId,
                 TenantId = tenantId,
                 PolicyId = policy.Id,
                 Success = true,
-                CoveragesExtracted = result.Coverages.Count
+                CoveragesExtracted = 0 // Minimal extraction - coverages handled by RAG
             });
 
             _logger.LogInformation(
-                "Extraction complete for {DocumentId}: Policy {PolicyId}, {CoverageCount} coverages, confidence {Confidence:P0}",
-                documentId, policy.Id, result.Coverages.Count, result.ConfidenceScore);
+                "Minimal extraction complete for {DocumentId}: Policy {PolicyId} (coverages via RAG)",
+                documentId, policy.Id);
 
             return policy.Id;
         }
@@ -192,7 +187,8 @@ public class ExtractionPipeline : IExtractionPipeline
     }
 
     /// <summary>
-    /// Create policy from extraction result (from old_src).
+    /// Create policy from minimal extraction result.
+    /// Only basic metadata - coverages handled by RAG in chat.
     /// </summary>
     private static Policy CreatePolicyFromExtraction(Guid tenantId, Guid documentId, PolicyExtractionResult result)
     {
@@ -206,35 +202,12 @@ public class ExtractionPipeline : IExtractionPipeline
             InsuredName = Truncate(result.NamedInsured, 255),
             EffectiveDate = result.EffectiveDate.HasValue ? DateOnly.FromDateTime(result.EffectiveDate.Value) : null,
             ExpirationDate = result.ExpirationDate.HasValue ? DateOnly.FromDateTime(result.ExpirationDate.Value) : null,
-            TotalPremium = result.TotalPremium,
+            TotalPremium = null, // Not extracted in minimal mode - available via RAG
             PolicyStatus = DeterminePolicyStatus(result.EffectiveDate, result.ExpirationDate),
-            RawExtraction = JsonSerializer.Serialize(result.AdditionalFields),
+            RawExtraction = null, // Not needed in minimal mode
             ExtractionConfidence = (decimal)result.ConfidenceScore,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
-        };
-    }
-
-    /// <summary>
-    /// Create coverage from extraction result (from old_src).
-    /// </summary>
-    private static Coverage CreateCoverageFromExtraction(Guid policyId, CoverageExtractionResult result)
-    {
-        return new Coverage
-        {
-            Id = Guid.NewGuid(),
-            PolicyId = policyId,
-            CoverageType = Truncate(result.CoverageType, 100) ?? "other",
-            Details = JsonSerializer.Serialize(new
-            {
-                description = result.CoverageDescription,
-                additionalDetails = result.AdditionalDetails
-            }),
-            EachOccurrenceLimit = result.LimitPerOccurrence,
-            AggregateLimit = result.LimitAggregate,
-            Deductible = result.Deductible,
-            Premium = result.Premium,
-            CreatedAt = DateTime.UtcNow
         };
     }
 

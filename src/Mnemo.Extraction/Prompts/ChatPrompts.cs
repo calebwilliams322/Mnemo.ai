@@ -30,6 +30,7 @@ public record CoverageContextData
     public decimal? AggregateLimit { get; init; }
     public decimal? Deductible { get; init; }
     public decimal? Premium { get; init; }
+    public string? Details { get; init; }
 }
 
 /// <summary>
@@ -157,6 +158,18 @@ public static class ChatPrompts
                             : "N/A";
 
                         sb.AppendLine($"| {coverageType} | {eachOccurrence} | {aggregate} | {deductible} | {premium} |");
+                    }
+
+                    // Add coverage details (exclusions, endorsements, etc.)
+                    var coveragesWithDetails = policy.Coverages.Where(c => !string.IsNullOrEmpty(c.Details)).ToList();
+                    if (coveragesWithDetails.Count > 0)
+                    {
+                        sb.AppendLine();
+                        sb.AppendLine("**Coverage Details:**");
+                        foreach (var coverage in coveragesWithDetails)
+                        {
+                            sb.AppendLine($"- **{coverage.CoverageType}**: {coverage.Details}");
+                        }
                     }
                 }
 

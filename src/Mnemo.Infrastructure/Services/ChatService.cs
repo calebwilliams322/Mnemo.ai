@@ -217,7 +217,8 @@ public partial class ChatService : IChatService
                             EachOccurrenceLimit = c.EachOccurrenceLimit,
                             AggregateLimit = c.AggregateLimit,
                             Deductible = c.Deductible,
-                            Premium = c.Premium
+                            Premium = c.Premium,
+                            Details = c.Details != "{}" ? c.Details : null
                         }).ToList()
                     })
                     .ToListAsync(ct);

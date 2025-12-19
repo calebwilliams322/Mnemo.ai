@@ -16,8 +16,8 @@ namespace Mnemo.Extraction.Services;
 public class ClaudeExtractionSettings
 {
     public string ApiKey { get; set; } = string.Empty;
-    public string Model { get; set; } = "claude-sonnet-4-20250514";
-    public int MaxTokens { get; set; } = 4096;
+    public string Model { get; set; } = "claude-3-5-haiku-20241022";
+    public int MaxTokens { get; set; } = 1024; // Reduced for minimal extraction
     public int MaxRetries { get; set; } = 3;
 }
 
@@ -98,18 +98,13 @@ public class ClaudeExtractionService : IClaudeExtractionService
     }
 
     /// <summary>
-    /// Build extraction prompt (from old_src).
+    /// Build minimal extraction prompt - only basic metadata fields.
+    /// RAG handles coverage details in chat. This is fast and cheap with Haiku.
     /// </summary>
     private static string BuildExtractionPrompt(string pdfText)
     {
         return $$"""
-            You are an expert insurance document analyzer. Extract structured data from the following insurance policy document text.
-
-            <document>
-            {{pdfText}}
-            </document>
-
-            Extract the following information and return it as valid JSON:
+            Extract basic metadata from this insurance document. Return ONLY valid JSON:
 
             {
                 "policyNumber": "string or null",
@@ -117,40 +112,16 @@ public class ClaudeExtractionService : IClaudeExtractionService
                 "documentType": "Policy|Quote|Binder|Endorsement|Certificate|Other or null",
                 "effectiveDate": "YYYY-MM-DD or null",
                 "expirationDate": "YYYY-MM-DD or null",
-                "namedInsured": "string or null",
-                "insuredAddress": "string or null",
-                "totalPremium": number or null,
-                "coverages": [
-                    {
-                        "coverageType": "GeneralLiability|ProfessionalLiability|CommercialProperty|BusinessAuto|WorkersCompensation|UmbrellaExcess|CyberLiability|DirectorsOfficers|EmploymentPractices|ProductLiability|InlandMarine|BusinessOwners|Other",
-                        "coverageDescription": "string",
-                        "limitPerOccurrence": number or null,
-                        "limitAggregate": number or null,
-                        "deductible": number or null,
-                        "premium": number or null,
-                        "additionalDetails": "string or null"
-                    }
-                ],
-                "additionalFields": {
-                    "key": "value"
-                },
-                "confidenceScore": 0.0 to 1.0,
-                "extractionNotes": "string describing any issues or uncertainties"
+                "namedInsured": "string or null"
             }
 
-            Important:
-            - Extract ALL coverages found in the document
-            - For monetary values, use numbers without currency symbols or commas
-            - Set confidenceScore based on how complete and clear the document was
-            - Include any relevant additional fields not covered above
-            - If a field cannot be determined, use null
-
-            Return ONLY the JSON object, no additional text.
+            Document:
+            {{pdfText}}
             """;
     }
 
     /// <summary>
-    /// Parse extraction response (from old_src).
+    /// Parse minimal extraction response - only 6 fields.
     /// </summary>
     private PolicyExtractionResult ParseExtractionResponse(string responseText)
     {
@@ -167,32 +138,7 @@ public class ClaudeExtractionService : IClaudeExtractionService
         using var doc = JsonDocument.Parse(jsonText);
         var root = doc.RootElement;
 
-        var coverages = new List<CoverageExtractionResult>();
-        if (root.TryGetProperty("coverages", out var coveragesElement))
-        {
-            foreach (var coverage in coveragesElement.EnumerateArray())
-            {
-                coverages.Add(new CoverageExtractionResult(
-                    ParseCoverageType(coverage.GetProperty("coverageType").GetString()),
-                    coverage.TryGetProperty("coverageDescription", out var desc) ? desc.GetString() ?? "" : "",
-                    GetNullableDecimalOld(coverage, "limitPerOccurrence"),
-                    GetNullableDecimalOld(coverage, "limitAggregate"),
-                    GetNullableDecimalOld(coverage, "deductible"),
-                    GetNullableDecimalOld(coverage, "premium"),
-                    GetNullableStringOld(coverage, "additionalDetails")
-                ));
-            }
-        }
-
-        var additionalFields = new Dictionary<string, string>();
-        if (root.TryGetProperty("additionalFields", out var additionalElement))
-        {
-            foreach (var prop in additionalElement.EnumerateObject())
-            {
-                additionalFields[prop.Name] = prop.Value.ToString();
-            }
-        }
-
+        // Minimal extraction - only 6 fields, no coverages
         return new PolicyExtractionResult(
             GetNullableStringOld(root, "policyNumber"),
             GetNullableStringOld(root, "carrierName"),
@@ -200,36 +146,13 @@ public class ClaudeExtractionService : IClaudeExtractionService
             GetNullableDateTimeOld(root, "effectiveDate"),
             GetNullableDateTimeOld(root, "expirationDate"),
             GetNullableStringOld(root, "namedInsured"),
-            GetNullableStringOld(root, "insuredAddress"),
-            GetNullableDecimalOld(root, "totalPremium"),
-            coverages,
-            additionalFields,
-            root.TryGetProperty("confidenceScore", out var confidence) ? confidence.GetDouble() : 0.5,
-            GetNullableStringOld(root, "extractionNotes")
+            InsuredAddress: null,       // Not extracted in minimal mode
+            TotalPremium: null,         // Not extracted in minimal mode
+            Coverages: [],              // Not extracted - RAG handles this
+            AdditionalFields: new(),    // Not extracted in minimal mode
+            ConfidenceScore: 0.8,       // High confidence for simple extraction
+            ExtractionNotes: null
         );
-    }
-
-    /// <summary>
-    /// Parse coverage type string to normalized format (from old_src).
-    /// </summary>
-    private static string ParseCoverageType(string? value)
-    {
-        return value switch
-        {
-            "GeneralLiability" => "general_liability",
-            "ProfessionalLiability" => "professional_liability",
-            "CommercialProperty" or "PropertyDamage" => "commercial_property",
-            "BusinessAuto" or "AutoLiability" => "business_auto",
-            "WorkersCompensation" => "workers_compensation",
-            "UmbrellaExcess" => "umbrella_excess",
-            "CyberLiability" => "cyber_liability",
-            "DirectorsOfficers" => "directors_officers",
-            "EmploymentPractices" => "employment_practices",
-            "ProductLiability" => "product_liability",
-            "InlandMarine" => "inland_marine",
-            "BusinessOwners" => "business_owners",
-            _ => "other"
-        };
     }
 
     private static string? GetNullableStringOld(JsonElement element, string propertyName)

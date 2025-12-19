@@ -3,6 +3,7 @@ import {
   DocumentMagnifyingGlassIcon,
   ShieldExclamationIcon,
   DocumentTextIcon,
+  ScaleIcon,
 } from '@heroicons/react/24/outline';
 import { clsx } from 'clsx';
 
@@ -47,6 +48,16 @@ const actions: QuickAction[] = [
     badge: 'Coming Soon',
     iconBgColor: 'bg-emerald-100',
     iconColor: 'text-emerald-600',
+  },
+  {
+    id: 'quote-comparison',
+    title: 'Quote Comparison',
+    description: 'Compare quotes from multiple carriers side-by-side',
+    icon: ScaleIcon,
+    disabled: true,
+    badge: 'Coming Soon',
+    iconBgColor: 'bg-violet-100',
+    iconColor: 'text-violet-600',
   },
 ];
 

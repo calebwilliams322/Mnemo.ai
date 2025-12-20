@@ -15,6 +15,8 @@ import { PolicySummaryPage } from './pages/PolicySummaryPage';
 import { QuoteComparisonPage } from './pages/QuoteComparisonPage';
 import { ChatPage } from './pages/ChatPage';
 import { LandingPage } from './pages/LandingPage';
+import { UsageDashboardPage } from './pages/admin/UsageDashboardPage';
+import { AdminRoute } from './components/admin/AdminRoute';
 
 // Protected Route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -98,6 +100,16 @@ function App() {
           <Route path="/quote-comparison" element={<QuoteComparisonPage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/chat/:id" element={<ChatPage />} />
+
+          {/* Admin routes - additional superadmin check */}
+          <Route
+            path="/admin/usage"
+            element={
+              <AdminRoute>
+                <UsageDashboardPage />
+              </AdminRoute>
+            }
+          />
         </Route>
 
         {/* Catch all */}

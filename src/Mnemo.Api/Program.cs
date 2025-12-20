@@ -150,6 +150,9 @@ builder.Services.AddScoped<IEventHandler<DocumentProcessedEvent>, DocumentProces
 // Register Webhook Service
 builder.Services.AddScoped<IWebhookService, WebhookService>();
 
+// Register Usage Service (admin analytics)
+builder.Services.AddScoped<IUsageService, UsageService>();
+
 // Register webhook event handlers (subscribe to same events as SignalR)
 builder.Services.AddScoped<IEventHandler<DocumentUploadedEvent>, WebhookDocumentUploadedHandler>();
 builder.Services.AddScoped<IEventHandler<DocumentProcessingStartedEvent>, WebhookDocumentProcessingStartedHandler>();
@@ -1997,6 +2000,145 @@ app.MapDelete("/conversations/{id:guid}/policies/{policyId:guid}", async (
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("RemovePolicyFromConversation")
 .WithTags("Chat")
+.RequireRateLimiting("api");
+
+// ==========================================
+// ADMIN ENDPOINTS (Superadmin only)
+// ==========================================
+
+// Helper to check if user is superadmin
+static bool IsSuperAdmin(string? email)
+{
+    if (string.IsNullOrEmpty(email)) return false;
+    var superAdminEmails = Environment.GetEnvironmentVariable("SUPERADMIN_EMAILS") ?? "";
+    var adminList = superAdminEmails.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    return adminList.Contains(email, StringComparer.OrdinalIgnoreCase);
+}
+
+// GET /admin/usage/tenants - Get usage for all tenants
+app.MapGet("/admin/usage/tenants", async (
+    [FromQuery] DateTime? startDate,
+    [FromQuery] DateTime? endDate,
+    IUsageService usageService,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    // Get current user's email to check superadmin
+    if (!currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    var user = await db.Users
+        .Where(u => u.Id == currentUser.UserId.Value)
+        .Select(u => new { u.Email })
+        .FirstOrDefaultAsync();
+
+    if (user == null || !IsSuperAdmin(user.Email))
+    {
+        logger.LogWarning("Non-superadmin user {UserId} attempted to access admin usage endpoint", currentUser.UserId);
+        return Results.Forbid();
+    }
+
+    var range = new DateRange(
+        startDate ?? DateTime.UtcNow.AddDays(-30),
+        endDate ?? DateTime.UtcNow
+    );
+
+    var usage = await usageService.GetAllTenantsUsageAsync(range);
+
+    // Calculate totals
+    var totals = new
+    {
+        totalMessages = usage.Sum(t => t.MessageCount),
+        totalInputTokens = usage.Sum(t => t.TotalInputTokens),
+        totalOutputTokens = usage.Sum(t => t.TotalOutputTokens),
+        totalCost = usage.Sum(t => t.EstimatedCost),
+        tenantCount = usage.Count
+    };
+
+    return Results.Ok(new { tenants = usage, totals, range = new { range.StartDate, range.EndDate } });
+})
+.RequireAuthorization()
+.WithName("GetAllTenantsUsage")
+.WithTags("Admin")
+.RequireRateLimiting("api");
+
+// GET /admin/usage/tenants/{tenantId}/users - Get per-user usage for a tenant
+app.MapGet("/admin/usage/tenants/{tenantId:guid}/users", async (
+    Guid tenantId,
+    [FromQuery] DateTime? startDate,
+    [FromQuery] DateTime? endDate,
+    IUsageService usageService,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    var user = await db.Users
+        .Where(u => u.Id == currentUser.UserId.Value)
+        .Select(u => new { u.Email })
+        .FirstOrDefaultAsync();
+
+    if (user == null || !IsSuperAdmin(user.Email))
+    {
+        logger.LogWarning("Non-superadmin user {UserId} attempted to access admin usage endpoint", currentUser.UserId);
+        return Results.Forbid();
+    }
+
+    var range = new DateRange(
+        startDate ?? DateTime.UtcNow.AddDays(-30),
+        endDate ?? DateTime.UtcNow
+    );
+
+    var users = await usageService.GetTenantUserUsageAsync(tenantId, range);
+
+    // Get tenant name
+    var tenant = await db.Tenants
+        .Where(t => t.Id == tenantId)
+        .Select(t => new { t.Name })
+        .FirstOrDefaultAsync();
+
+    return Results.Ok(new
+    {
+        tenantId,
+        tenantName = tenant?.Name ?? "Unknown",
+        users,
+        range = new { range.StartDate, range.EndDate }
+    });
+})
+.RequireAuthorization()
+.WithName("GetTenantUserUsage")
+.WithTags("Admin")
+.RequireRateLimiting("api");
+
+// GET /admin/me - Check if current user is superadmin
+app.MapGet("/admin/me", async (
+    ICurrentUserService currentUser,
+    MnemoDbContext db) =>
+{
+    if (!currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    var user = await db.Users
+        .Where(u => u.Id == currentUser.UserId.Value)
+        .Select(u => new { u.Email, u.Name })
+        .FirstOrDefaultAsync();
+
+    if (user == null)
+        return Results.NotFound();
+
+    return Results.Ok(new
+    {
+        isSuperAdmin = IsSuperAdmin(user.Email),
+        email = user.Email,
+        name = user.Name
+    });
+})
+.RequireAuthorization()
+.WithName("GetAdminStatus")
+.WithTags("Admin")
 .RequireRateLimiting("api");
 
 app.Run();

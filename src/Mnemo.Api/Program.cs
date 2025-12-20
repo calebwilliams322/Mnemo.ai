@@ -2039,10 +2039,14 @@ app.MapGet("/admin/usage/tenants", async (
         return Results.Forbid();
     }
 
-    var range = new DateRange(
-        startDate ?? DateTime.UtcNow.AddDays(-30),
-        endDate ?? DateTime.UtcNow
-    );
+    // Ensure dates are UTC (query params come as Unspecified kind)
+    var start = startDate.HasValue
+        ? DateTime.SpecifyKind(startDate.Value, DateTimeKind.Utc)
+        : DateTime.UtcNow.AddDays(-30);
+    var end = endDate.HasValue
+        ? DateTime.SpecifyKind(endDate.Value.AddDays(1).AddSeconds(-1), DateTimeKind.Utc) // End of day
+        : DateTime.UtcNow;
+    var range = new DateRange(start, end);
 
     var usage = await usageService.GetAllTenantsUsageAsync(range);
 
@@ -2087,10 +2091,14 @@ app.MapGet("/admin/usage/tenants/{tenantId:guid}/users", async (
         return Results.Forbid();
     }
 
-    var range = new DateRange(
-        startDate ?? DateTime.UtcNow.AddDays(-30),
-        endDate ?? DateTime.UtcNow
-    );
+    // Ensure dates are UTC (query params come as Unspecified kind)
+    var start = startDate.HasValue
+        ? DateTime.SpecifyKind(startDate.Value, DateTimeKind.Utc)
+        : DateTime.UtcNow.AddDays(-30);
+    var end = endDate.HasValue
+        ? DateTime.SpecifyKind(endDate.Value.AddDays(1).AddSeconds(-1), DateTimeKind.Utc) // End of day
+        : DateTime.UtcNow;
+    var range = new DateRange(start, end);
 
     var users = await usageService.GetTenantUserUsageAsync(tenantId, range);
 

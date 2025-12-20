@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { format, subDays } from 'date-fns';
 import {
   ChartBarIcon,
@@ -255,9 +255,8 @@ export function UsageDashboardPage() {
                     </thead>
                     <tbody>
                       {tenants.map((tenant) => (
-                        <>
+                        <Fragment key={tenant.tenantId}>
                           <tr
-                            key={tenant.tenantId}
                             className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer"
                             onClick={() => toggleTenantExpand(tenant.tenantId)}
                           >
@@ -303,7 +302,7 @@ export function UsageDashboardPage() {
                               </td>
                             </tr>
                           )}
-                        </>
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>

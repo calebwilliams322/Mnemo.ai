@@ -1,11 +1,19 @@
-import { Fragment } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { Menu, MenuButton, MenuItem, MenuItems, Transition } from '@headlessui/react';
 import { UserCircleIcon, ArrowRightOnRectangleIcon, Cog6ToothIcon } from '@heroicons/react/24/outline';
 import { useAuthStore } from '../../stores/authStore';
 import { Link } from 'react-router-dom';
+import { getAdminStatus } from '../../api/admin';
 
 export function Navbar() {
   const { user, logout } = useAuthStore();
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    getAdminStatus()
+      .then((status) => setIsAdmin(status.isSuperAdmin))
+      .catch(() => setIsAdmin(false));
+  }, []);
 
   const handleLogout = async () => {
     try {
@@ -32,6 +40,14 @@ export function Navbar() {
           >
             About
           </Link>
+          {isAdmin && (
+            <Link
+              to="/admin/usage"
+              className="text-sm font-medium text-gray-600 hover:text-primary-600 transition-colors"
+            >
+              Admin
+            </Link>
+          )}
           <Menu as="div" className="relative">
             <MenuButton className="flex items-center gap-2 text-sm text-gray-700 hover:text-gray-900">
               <UserCircleIcon className="h-8 w-8 text-gray-400" />

@@ -90,29 +90,41 @@ public class ClaudeChatService : IClaudeChatService
             }
 
             // Track token usage from response
-            if (response.Usage != null)
+            // Input tokens come from StreamStartMessage (first event)
+            if (response.StreamStartMessage?.Usage != null)
             {
-                if (response.Usage.InputTokens > 0)
-                    inputTokens = response.Usage.InputTokens;
-                if (response.Usage.OutputTokens > 0)
-                    outputTokens = response.Usage.OutputTokens;
+                _logger.LogInformation("Input tokens from StreamStartMessage: {Input}",
+                    response.StreamStartMessage.Usage.InputTokens);
+                inputTokens = response.StreamStartMessage.Usage.InputTokens;
+            }
+            // Output tokens come from Usage on later events
+            if (response.Usage?.OutputTokens > 0)
+            {
+                _logger.LogInformation("Output tokens from Usage: {Output}",
+                    response.Usage.OutputTokens);
+                outputTokens = response.Usage.OutputTokens;
             }
 
             // Check for stop reason (end of message)
             if (response.StopReason != null)
             {
                 _logger.LogInformation(
-                    "Streaming chat complete: {InputTokens} input, {OutputTokens} output tokens, StopReason: {StopReason}",
-                    inputTokens, outputTokens, response.StopReason);
-
-                yield return new ChatStreamEvent
-                {
-                    Type = "message_stop",
-                    InputTokens = inputTokens,
-                    OutputTokens = outputTokens
-                };
+                    "StopReason received: {StopReason}",
+                    response.StopReason);
             }
         }
+
+        // After streaming completes, emit final event with token counts
+        _logger.LogInformation(
+            "Streaming chat complete: {InputTokens} input, {OutputTokens} output tokens",
+            inputTokens, outputTokens);
+
+        yield return new ChatStreamEvent
+        {
+            Type = "message_stop",
+            InputTokens = inputTokens,
+            OutputTokens = outputTokens
+        };
     }
 
     public async Task<ChatResponse> SendChatAsync(

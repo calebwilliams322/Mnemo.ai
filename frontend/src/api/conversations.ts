@@ -43,9 +43,15 @@ export async function sendMessage(
   onToken: (text: string) => void,
   onComplete: (messageId: string, citedChunkIds: string[]) => void,
   onError: (error: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  activePolicyIds?: string[] // Optional: only search these policies
 ): Promise<void> {
   const token = await getAccessToken();
+
+  const body: { content: string; activePolicyIds?: string[] } = { content };
+  if (activePolicyIds && activePolicyIds.length > 0) {
+    body.activePolicyIds = activePolicyIds;
+  }
 
   const response = await fetch(
     `${API_URL}/conversations/${conversationId}/messages`,
@@ -55,7 +61,7 @@ export async function sendMessage(
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
       signal,
     }
   );
@@ -113,4 +119,26 @@ export async function sendMessage(
       }
     }
   }
+}
+
+// POST /conversations/{id}/policies - Add policies to conversation
+export async function addPoliciesToConversation(
+  conversationId: string,
+  policyIds: string[]
+): Promise<{ policyIds: string[]; documentIds: string[]; addedCount: number }> {
+  const response = await apiClient.post(`/conversations/${conversationId}/policies`, {
+    policyIds,
+  });
+  return response.data;
+}
+
+// DELETE /conversations/{id}/policies/{policyId} - Remove policy from conversation
+export async function removePolicyFromConversation(
+  conversationId: string,
+  policyId: string
+): Promise<{ policyIds: string[]; documentIds: string[]; removed: string }> {
+  const response = await apiClient.delete(
+    `/conversations/${conversationId}/policies/${policyId}`
+  );
+  return response.data;
 }

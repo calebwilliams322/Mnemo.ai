@@ -48,6 +48,18 @@ public record SemanticSearchRequest
     /// Results below this threshold are filtered out.
     /// </summary>
     public double MinSimilarity { get; init; } = 0.7;
+
+    /// <summary>
+    /// When true, performs balanced retrieval across multiple policies.
+    /// Each policy gets equal chunk allocation (12 chunks per policy).
+    /// Default: false (standard search behavior).
+    /// </summary>
+    public bool BalancedRetrieval { get; init; } = false;
+
+    /// <summary>
+    /// Number of chunks per policy when BalancedRetrieval is true. Default: 12.
+    /// </summary>
+    public int ChunksPerPolicy { get; init; } = 12;
 }
 
 /// <summary>
@@ -68,4 +80,20 @@ public record ChunkSearchResult
     /// Cosine similarity score (0-1). Higher is more similar.
     /// </summary>
     public double Similarity { get; init; }
+
+    /// <summary>
+    /// The policy ID this chunk belongs to (for multi-policy comparison).
+    /// Set when BalancedRetrieval is used.
+    /// </summary>
+    public Guid? PolicyId { get; init; }
+
+    /// <summary>
+    /// Carrier name for the policy (for context labeling).
+    /// </summary>
+    public string? CarrierName { get; init; }
+
+    /// <summary>
+    /// Policy number (for context labeling).
+    /// </summary>
+    public string? PolicyNumber { get; init; }
 }

@@ -41,6 +41,24 @@ public record SendMessageRequest
     /// The message content from the user.
     /// </summary>
     public required string Content { get; init; }
+
+    /// <summary>
+    /// Optional: Only search these policy IDs for RAG context.
+    /// Must be a subset of the conversation's attached policies.
+    /// If null/empty, all attached policies are searched.
+    /// </summary>
+    public List<Guid>? ActivePolicyIds { get; init; }
+}
+
+/// <summary>
+/// Request to add policies to an existing conversation.
+/// </summary>
+public record AddPoliciesToConversationRequest
+{
+    /// <summary>
+    /// The policy IDs to add to the conversation.
+    /// </summary>
+    public required List<Guid> PolicyIds { get; init; }
 }
 
 /// <summary>

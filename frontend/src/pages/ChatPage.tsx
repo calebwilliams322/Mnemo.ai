@@ -6,6 +6,8 @@ import { UploadDropzone } from '../components/documents/UploadDropzone';
 import { MessageBubble } from '../components/chat/MessageBubble';
 import { ChatInput } from '../components/chat/ChatInput';
 import { ChatQuickActions, QUICK_ACTION_PROMPTS } from '../components/chat/ChatQuickActions';
+import { ActivePoliciesPanel } from '../components/chat/ActivePoliciesPanel';
+import { AddPolicyModal } from '../components/chat/AddPolicyModal';
 import {
   getConversations,
   getConversation,
@@ -13,6 +15,8 @@ import {
   deleteConversation,
   sendMessage,
   updateConversation,
+  removePolicyFromConversation,
+  addPoliciesToConversation,
 } from '../api/conversations';
 import { useDocumentStore } from '../stores/documentStore';
 import { onProcessingComplete, offProcessingComplete } from '../lib/signalr';
@@ -37,6 +41,16 @@ const SUMMARY_PROMPT = `Please provide a comprehensive summary of this insurance
 
 Please be thorough but concise, and cite specific page numbers where possible.`;
 
+const COMPARISON_PROMPT = `Compare all policies in this conversation. Create a comprehensive comparison including:
+
+1. Overview table with carrier, insured, policy period, and premium for each policy
+2. Coverage limits side-by-side comparison
+3. Deductibles comparison
+4. Key differences and coverage gaps
+5. Brief recommendation summary
+
+Use data tables where appropriate.`;
+
 export function ChatPage() {
   const { id } = useParams<{ id: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -44,6 +58,7 @@ export function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const autoSummaryTriggered = useRef(false);
+  const autoComparisonTriggered = useRef(false);
 
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [currentConversation, setCurrentConversation] = useState<{ title?: string; policyIds?: string[] } | null>(null);
@@ -52,16 +67,24 @@ export function ChatPage() {
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [isSending, setIsSending] = useState(false);
 
+  // Policy toggle state - which policies are active for searching
+  const [activePolicyIds, setActivePolicyIds] = useState<string[]>([]);
+
   // Naming banner state
   const [showNamingBanner, setShowNamingBanner] = useState(false);
   const [conversationName, setConversationName] = useState('');
   const [isSavingName, setIsSavingName] = useState(false);
 
+  // Add policy modal state
+  const [showAddPolicyModal, setShowAddPolicyModal] = useState(false);
+
   // Auto-summary state
   const [pendingAutoSummary, setPendingAutoSummary] = useState<string | null>(null);
+  const [pendingAutoComparison, setPendingAutoComparison] = useState<string | null>(null);
 
   const { uploadingFiles } = useDocumentStore();
   const autoSummary = searchParams.get('autoSummary') === 'true';
+  const autoComparison = searchParams.get('autoComparison') === 'true';
 
   // Load conversations list
   const loadConversations = useCallback(async () => {
@@ -86,7 +109,9 @@ export function ChatPage() {
       if (!id) {
         setMessages([]);
         setCurrentConversation(null);
+        setActivePolicyIds([]);
         autoSummaryTriggered.current = false;
+        autoComparisonTriggered.current = false;
         return;
       }
 
@@ -97,6 +122,8 @@ export function ChatPage() {
           title: conversation?.title ?? undefined,
           policyIds: conversation?.policyIds ?? undefined,
         });
+        // Initialize all policies as active
+        setActivePolicyIds(conversation?.policyIds ?? []);
         setMessages(
           (conversation?.messages || []).map((m: Message) => ({
             id: m.id,
@@ -133,6 +160,20 @@ export function ChatPage() {
       setPendingAutoSummary(id);
     }
   }, [autoSummary, id, messages.length, isLoadingMessages, currentConversation?.title, setSearchParams]);
+
+  // Handle auto-comparison trigger - set up the pending comparison
+  useEffect(() => {
+    if (autoComparison && id && !autoComparisonTriggered.current && messages.length === 0 && !isLoadingMessages) {
+      autoComparisonTriggered.current = true;
+      // Clear the query param
+      setSearchParams({}, { replace: true });
+      // Show the naming banner with default title
+      setConversationName(currentConversation?.title || '');
+      setShowNamingBanner(true);
+      // Queue the auto-comparison to be sent
+      setPendingAutoComparison(id);
+    }
+  }, [autoComparison, id, messages.length, isLoadingMessages, currentConversation?.title, setSearchParams]);
 
   // Actually send the pending auto-summary when ready
   useEffect(() => {
@@ -208,8 +249,83 @@ export function ChatPage() {
     sendAutoSummary();
   }, [pendingAutoSummary, isSending, loadConversations]);
 
-  // Listen for document processing completion (for uploads from this page)
+  // Actually send the pending auto-comparison when ready
   useEffect(() => {
+    if (!pendingAutoComparison || isSending) return;
+
+    const convId = pendingAutoComparison;
+    setPendingAutoComparison(null);
+
+    let streamedContent = '';
+    const messageId = `assistant-${Date.now()}`;
+
+    const sendAutoComparison = async () => {
+      const assistantMessage: LocalMessage = {
+        id: messageId,
+        role: 'assistant',
+        content: '',
+        isStreaming: true,
+      };
+
+      setMessages([assistantMessage]);
+      setIsSending(true);
+
+      console.log('[Auto-comparison] Sending to conversation:', convId);
+
+      try {
+        await sendMessage(
+          convId,
+          COMPARISON_PROMPT,
+          (text) => {
+            streamedContent += text;
+            setMessages([{
+              id: messageId,
+              role: 'assistant',
+              content: streamedContent,
+              isStreaming: true,
+            }]);
+          },
+          (finalMessageId) => {
+            console.log('[Auto-comparison] Complete, final message ID:', finalMessageId);
+            setMessages([{
+              id: finalMessageId,
+              role: 'assistant',
+              content: streamedContent,
+              isStreaming: false,
+            }]);
+            loadConversations();
+          },
+          (error) => {
+            notify.error('Auto-comparison failed', error);
+            setMessages([{
+              id: messageId,
+              role: 'assistant',
+              content: 'Sorry, an error occurred generating the comparison.',
+              isStreaming: false,
+            }]);
+          },
+          undefined,
+          activePolicyIds // Pass active policies for balanced retrieval
+        );
+      } catch (error) {
+        console.error('[Auto-comparison] Error:', error);
+        notify.error('Failed to generate comparison');
+      } finally {
+        console.log('[Auto-comparison] Finished');
+        setIsSending(false);
+      }
+    };
+
+    sendAutoComparison();
+  }, [pendingAutoComparison, isSending, loadConversations, activePolicyIds]);
+
+  // Listen for document processing completion (for uploads from the LIST view only)
+  // When already in a conversation, the AddPolicyModal handles adding to current conversation
+  useEffect(() => {
+    // Only handle uploads when on the list view (no conversation selected)
+    // If we're in a conversation, the modal will handle adding the policy
+    if (id) return;
+
     const handleProcessingComplete = async (event: ProcessingCompleteEvent) => {
       const isOurUpload = Array.from(uploadingFiles.values()).some(
         (upload) => upload.documentId === event.documentId
@@ -238,7 +354,7 @@ export function ChatPage() {
 
     onProcessingComplete(handleProcessingComplete);
     return () => offProcessingComplete(handleProcessingComplete);
-  }, [uploadingFiles, navigate]);
+  }, [id, uploadingFiles, navigate]);
 
   const handleDeleteConversation = async (convId: string) => {
     try {
@@ -316,7 +432,8 @@ export function ChatPage() {
             ];
           });
         },
-        abortControllerRef.current.signal
+        abortControllerRef.current.signal,
+        activePolicyIds // Pass active policies for balanced retrieval
       );
     } catch (error) {
       if (error instanceof Error && error.name !== 'AbortError') {
@@ -348,6 +465,56 @@ export function ChatPage() {
 
   const handleSkipNaming = () => {
     setShowNamingBanner(false);
+  };
+
+  // Policy toggle handler
+  const handleTogglePolicy = (policyId: string) => {
+    setActivePolicyIds((prev) => {
+      if (prev.includes(policyId)) {
+        return prev.filter((id) => id !== policyId);
+      } else {
+        return [...prev, policyId];
+      }
+    });
+  };
+
+  // Remove policy from conversation
+  const handleRemovePolicy = async (policyId: string) => {
+    if (!id) return;
+
+    try {
+      console.log('[RemovePolicy] Removing policy:', policyId, 'from conversation:', id);
+      const result = await removePolicyFromConversation(id, policyId);
+      console.log('[RemovePolicy] Success, result:', result);
+      setCurrentConversation((prev) => prev ? { ...prev, policyIds: result.policyIds } : null);
+      setActivePolicyIds((prev) => prev.filter((pid) => pid !== policyId));
+      notify.success('Policy removed from conversation');
+    } catch (error: unknown) {
+      console.error('[RemovePolicy] Failed:', error);
+      const axiosError = error as { response?: { status?: number; data?: unknown } };
+      if (axiosError.response) {
+        console.error('[RemovePolicy] Response status:', axiosError.response.status);
+        console.error('[RemovePolicy] Response data:', axiosError.response.data);
+      }
+      notify.error('Failed to remove policy');
+    }
+  };
+
+  // Add policies to conversation
+  const handleAddPolicies = async (policyIds: string[]) => {
+    if (!id) return;
+
+    try {
+      const result = await addPoliciesToConversation(id, policyIds);
+      setCurrentConversation((prev) => prev ? { ...prev, policyIds: result.policyIds } : null);
+      // Add new policies to active list
+      setActivePolicyIds((prev) => [...prev, ...policyIds.filter((pid) => !prev.includes(pid))]);
+      notify.success(`Added ${policyIds.length} ${policyIds.length === 1 ? 'policy' : 'policies'} to conversation`);
+    } catch (error) {
+      console.error('Failed to add policies:', error);
+      notify.error('Failed to add policies');
+      throw error; // Re-throw so modal knows it failed
+    }
   };
 
   // LIST VIEW - When no conversation is selected
@@ -534,7 +701,7 @@ export function ChatPage() {
                 </div>
               ) : (
                 messages
-                  .filter((m) => m.role !== 'user' || (m.content !== SUMMARY_PROMPT && !QUICK_ACTION_PROMPTS.has(m.content)))
+                  .filter((m) => m.role !== 'user' || (m.content !== SUMMARY_PROMPT && m.content !== COMPARISON_PROMPT && !QUICK_ACTION_PROMPTS.has(m.content)))
                   .map((message) => (
                     <MessageBubble
                       key={message.id}
@@ -547,11 +714,24 @@ export function ChatPage() {
               <div ref={messagesEndRef} />
             </div>
 
+            {/* Active Policies Panel - show when policies are attached */}
+            {currentConversation?.policyIds && currentConversation.policyIds.length > 0 && (
+              <ActivePoliciesPanel
+                policyIds={currentConversation.policyIds}
+                activePolicyIds={activePolicyIds}
+                onTogglePolicy={handleTogglePolicy}
+                onRemovePolicy={handleRemovePolicy}
+                onAddPolicy={() => setShowAddPolicyModal(true)}
+                maxPolicies={5}
+              />
+            )}
+
             {/* Quick Actions - only show when policy is loaded */}
             {currentConversation?.policyIds && currentConversation.policyIds.length > 0 && (
               <ChatQuickActions
                 onAction={handleSendMessage}
                 disabled={isSending}
+                activePolicyCount={activePolicyIds.length}
               />
             )}
 
@@ -564,6 +744,15 @@ export function ChatPage() {
           </>
         )}
       </div>
+
+      {/* Add Policy Modal */}
+      <AddPolicyModal
+        isOpen={showAddPolicyModal}
+        onClose={() => setShowAddPolicyModal(false)}
+        onAdd={handleAddPolicies}
+        existingPolicyIds={currentConversation?.policyIds || []}
+        maxPolicies={5}
+      />
     </div>
   );
 }

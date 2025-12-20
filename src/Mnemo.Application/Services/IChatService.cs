@@ -10,9 +10,15 @@ public interface IChatService
     /// <summary>
     /// Send a message in a conversation and stream the AI response.
     /// </summary>
+    /// <param name="conversationId">The conversation ID.</param>
+    /// <param name="userMessage">The user's message.</param>
+    /// <param name="activePolicyIds">Optional: Only search these policy IDs (subset of attached policies).
+    /// If null/empty, all attached policies are searched.</param>
+    /// <param name="ct">Cancellation token.</param>
     IAsyncEnumerable<ChatStreamResult> SendMessageAsync(
         Guid conversationId,
         string userMessage,
+        List<Guid>? activePolicyIds = null,
         CancellationToken ct = default);
 
     /// <summary>

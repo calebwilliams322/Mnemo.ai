@@ -12,6 +12,7 @@ import { DocumentsPage } from './pages/DocumentsPage';
 import { PoliciesPage } from './pages/PoliciesPage';
 import { PolicyDetailPage } from './pages/PolicyDetailPage';
 import { PolicySummaryPage } from './pages/PolicySummaryPage';
+import { QuoteComparisonPage } from './pages/QuoteComparisonPage';
 import { ChatPage } from './pages/ChatPage';
 import { LandingPage } from './pages/LandingPage';
 
@@ -94,6 +95,7 @@ function App() {
           <Route path="/policies" element={<PoliciesPage />} />
           <Route path="/policies/:id" element={<PolicyDetailPage />} />
           <Route path="/policy-summary" element={<PolicySummaryPage />} />
+          <Route path="/quote-comparison" element={<QuoteComparisonPage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/chat/:id" element={<ChatPage />} />
         </Route>

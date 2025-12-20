@@ -211,6 +211,7 @@ export interface Message {
 
 export interface SendMessageRequest {
   content: string;
+  activePolicyIds?: string[];
 }
 
 // SSE Stream Event Types (PascalCase from backend)

@@ -113,11 +113,13 @@ public partial class ChatService : IChatService
     public async IAsyncEnumerable<ChatStreamResult> SendMessageAsync(
         Guid conversationId,
         string userMessage,
+        List<Guid>? activePolicyIds = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         _logger.LogInformation(
-            "Processing chat message for conversation {ConversationId}",
-            conversationId);
+            "Processing chat message for conversation {ConversationId}, ActivePolicies={ActivePolicyCount}",
+            conversationId,
+            activePolicyIds?.Count ?? 0);
 
         // 0. Input validation
         if (string.IsNullOrWhiteSpace(userMessage))
@@ -187,8 +189,16 @@ public partial class ChatService : IChatService
         string? embeddingError = null;
 
         // Parse policy and document IDs from conversation (needed for both RAG and policy context)
-        var policyIds = ParseGuidArray(conversation.PolicyIds);
+        var allPolicyIds = ParseGuidArray(conversation.PolicyIds);
         var documentIds = ParseGuidArray(conversation.DocumentIds);
+
+        // Use activePolicyIds if provided, otherwise use all attached policies
+        var policyIds = activePolicyIds?.Count > 0
+            ? activePolicyIds.Where(id => allPolicyIds.Contains(id)).ToList() // Ensure they're valid attached policies
+            : allPolicyIds;
+
+        // Determine if we should use balanced retrieval (multiple active policies)
+        var useBalancedRetrieval = policyIds.Count > 1;
 
         // 4a. Load structured policy data for context (always include, regardless of RAG)
         List<PolicyContextData> policyContext = [];
@@ -291,7 +301,9 @@ public partial class ChatService : IChatService
                 PolicyIds = policyIds.Count > 0 ? policyIds : null,
                 DocumentIds = documentIds.Count > 0 ? documentIds : null,
                 TopK = _settings.MaxContextChunks,
-                MinSimilarity = _settings.MinSimilarity
+                MinSimilarity = _settings.MinSimilarity,
+                BalancedRetrieval = useBalancedRetrieval,
+                ChunksPerPolicy = 12 // Fixed 12 chunks per policy for quality comparisons
             };
 
             try
@@ -338,7 +350,7 @@ public partial class ChatService : IChatService
 
         // 8. Build the current user message with RAG context and structured policy data
         var currentUserContent = relevantChunks.Count > 0 || policyContext.Count > 0
-            ? ChatPrompts.BuildContextPrompt(relevantChunks, policyContext, userMessage)
+            ? ChatPrompts.BuildContextPrompt(relevantChunks, policyContext, userMessage, useBalancedRetrieval)
             : searchFailed
                 ? $"[Note: Document search is temporarily unavailable. Please answer based on general knowledge about insurance policies.]\n\n{userMessage}"
                 : userMessage;

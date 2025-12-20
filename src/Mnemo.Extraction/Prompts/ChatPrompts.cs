@@ -105,7 +105,7 @@ public static class ChatPrompts
         IEnumerable<ChunkSearchResult> chunks,
         string userQuery)
     {
-        return BuildContextPrompt(chunks, null, userQuery);
+        return BuildContextPrompt(chunks, null, userQuery, false);
     }
 
     /// <summary>
@@ -114,7 +114,8 @@ public static class ChatPrompts
     public static string BuildContextPrompt(
         IEnumerable<ChunkSearchResult> chunks,
         List<PolicyContextData>? policies,
-        string userQuery)
+        string userQuery,
+        bool groupByPolicy = false)
     {
         var sb = new StringBuilder();
 
@@ -198,8 +199,55 @@ public static class ChatPrompts
         {
             sb.AppendLine("*No relevant policy excerpts found for this query.*");
         }
+        else if (groupByPolicy && chunkList.Any(c => c.PolicyId.HasValue))
+        {
+            // Group chunks by policy for comparison mode
+            var groupedChunks = chunkList
+                .GroupBy(c => c.PolicyId ?? Guid.Empty)
+                .OrderBy(g => g.Key);
+
+            foreach (var group in groupedChunks)
+            {
+                var firstChunk = group.First();
+                var policyLabel = !string.IsNullOrEmpty(firstChunk.CarrierName)
+                    ? $"{firstChunk.CarrierName}"
+                    : "Unknown Carrier";
+
+                if (!string.IsNullOrEmpty(firstChunk.PolicyNumber))
+                {
+                    policyLabel += $" ({firstChunk.PolicyNumber})";
+                }
+
+                sb.AppendLine($"### {policyLabel} Excerpts");
+                sb.AppendLine();
+
+                foreach (var chunk in group)
+                {
+                    sb.AppendLine("---");
+                    sb.Append($"[Document: {chunk.DocumentName}");
+
+                    if (chunk.PageStart.HasValue)
+                    {
+                        sb.Append(chunk.PageEnd.HasValue && chunk.PageEnd != chunk.PageStart
+                            ? $", Pages {chunk.PageStart}-{chunk.PageEnd}"
+                            : $", Page {chunk.PageStart}");
+                    }
+
+                    if (!string.IsNullOrEmpty(chunk.SectionType))
+                    {
+                        sb.Append($", Section: {FormatSectionType(chunk.SectionType)}");
+                    }
+
+                    sb.AppendLine("]");
+                    sb.AppendLine(chunk.ChunkText);
+                }
+                sb.AppendLine();
+            }
+            sb.AppendLine("---");
+        }
         else
         {
+            // Standard flat list of chunks (single policy or legacy mode)
             foreach (var chunk in chunkList)
             {
                 sb.AppendLine("---");

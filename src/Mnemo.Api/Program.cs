@@ -1781,7 +1781,8 @@ app.MapPost("/conversations/{id:guid}/messages", async (
 
     try
     {
-        await foreach (var evt in chatService.SendMessageAsync(id, request.Content, ct))
+        // Pass activePolicyIds to enable policy toggle feature
+        await foreach (var evt in chatService.SendMessageAsync(id, request.Content, request.ActivePolicyIds, ct))
         {
             var json = JsonSerializer.Serialize(evt);
             await httpContext.Response.WriteAsync($"data: {json}\n\n", ct);
@@ -1866,6 +1867,135 @@ app.MapPatch("/conversations/{id:guid}", async (
 })
 .RequireAuthorization(AuthorizationPolicies.RequireTenant)
 .WithName("UpdateConversation")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
+// POST /conversations/{id}/policies - Add policies to conversation
+app.MapPost("/conversations/{id:guid}/policies", async (
+    Guid id,
+    AddPoliciesToConversationRequest request,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue || !currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    var conversation = await db.Conversations
+        .FirstOrDefaultAsync(c => c.Id == id && c.UserId == currentUser.UserId.Value);
+
+    if (conversation == null)
+        return Results.NotFound("Conversation not found");
+
+    // Parse existing policy IDs
+    var existingPolicyIds = JsonSerializer.Deserialize<List<Guid>>(conversation.PolicyIds) ?? [];
+
+    // Validate the policies exist and belong to tenant
+    var validPolicyIds = await db.Policies
+        .Where(p => request.PolicyIds.Contains(p.Id) && p.TenantId == currentUser.TenantId.Value)
+        .Select(p => p.Id)
+        .ToListAsync();
+
+    // Add new policies (avoid duplicates)
+    var newPolicyIds = validPolicyIds.Where(pid => !existingPolicyIds.Contains(pid)).ToList();
+    var updatedPolicyIds = existingPolicyIds.Concat(newPolicyIds).ToList();
+
+    // Enforce max 5 policies per conversation
+    if (updatedPolicyIds.Count > 5)
+    {
+        return Results.BadRequest($"Cannot add policies: conversation would exceed maximum of 5 policies. Current: {existingPolicyIds.Count}, Adding: {newPolicyIds.Count}");
+    }
+
+    // Get document IDs for the new policies
+    var newDocumentIds = await db.Policies
+        .Where(p => newPolicyIds.Contains(p.Id) && p.SourceDocumentId != null)
+        .Select(p => p.SourceDocumentId!.Value)
+        .ToListAsync();
+
+    var existingDocumentIds = JsonSerializer.Deserialize<List<Guid>>(conversation.DocumentIds) ?? [];
+    var updatedDocumentIds = existingDocumentIds.Concat(newDocumentIds).Distinct().ToList();
+
+    // Update conversation
+    conversation.PolicyIds = JsonSerializer.Serialize(updatedPolicyIds);
+    conversation.DocumentIds = JsonSerializer.Serialize(updatedDocumentIds);
+    conversation.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    logger.LogInformation(
+        "Added {NewPolicyCount} policies to conversation {ConversationId}. Total: {TotalPolicies}",
+        newPolicyIds.Count, id, updatedPolicyIds.Count);
+
+    return Results.Ok(new
+    {
+        policyIds = updatedPolicyIds,
+        documentIds = updatedDocumentIds,
+        addedCount = newPolicyIds.Count
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("AddPoliciesToConversation")
+.WithTags("Chat")
+.RequireRateLimiting("api");
+
+// DELETE /conversations/{id}/policies/{policyId} - Remove policy from conversation
+app.MapDelete("/conversations/{id:guid}/policies/{policyId:guid}", async (
+    Guid id,
+    Guid policyId,
+    ICurrentUserService currentUser,
+    MnemoDbContext db,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue || !currentUser.UserId.HasValue)
+        return Results.Unauthorized();
+
+    var conversation = await db.Conversations
+        .FirstOrDefaultAsync(c => c.Id == id && c.UserId == currentUser.UserId.Value);
+
+    if (conversation == null)
+        return Results.NotFound("Conversation not found");
+
+    // Parse existing IDs
+    var policyIds = JsonSerializer.Deserialize<List<Guid>>(conversation.PolicyIds) ?? [];
+    var documentIds = JsonSerializer.Deserialize<List<Guid>>(conversation.DocumentIds) ?? [];
+
+    if (!policyIds.Contains(policyId))
+    {
+        return Results.BadRequest("Policy is not attached to this conversation");
+    }
+
+    // Remove policy
+    policyIds.Remove(policyId);
+
+    // Get the document ID for this policy to remove
+    var documentIdToRemove = await db.Policies
+        .Where(p => p.Id == policyId && p.SourceDocumentId != null)
+        .Select(p => p.SourceDocumentId!.Value)
+        .FirstOrDefaultAsync();
+
+    if (documentIdToRemove != Guid.Empty)
+    {
+        documentIds.Remove(documentIdToRemove);
+    }
+
+    // Update conversation
+    conversation.PolicyIds = JsonSerializer.Serialize(policyIds);
+    conversation.DocumentIds = JsonSerializer.Serialize(documentIds);
+    conversation.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    logger.LogInformation(
+        "Removed policy {PolicyId} from conversation {ConversationId}. Remaining: {RemainingPolicies}",
+        policyId, id, policyIds.Count);
+
+    return Results.Ok(new
+    {
+        policyIds,
+        documentIds,
+        removed = policyId
+    });
+})
+.RequireAuthorization(AuthorizationPolicies.RequireTenant)
+.WithName("RemovePolicyFromConversation")
 .WithTags("Chat")
 .RequireRateLimiting("api");
 

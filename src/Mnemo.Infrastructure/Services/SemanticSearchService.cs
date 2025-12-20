@@ -28,6 +28,23 @@ public class SemanticSearchService : ISemanticSearchService
         SemanticSearchRequest request,
         CancellationToken ct = default)
     {
+        // Use balanced retrieval for multi-policy comparison
+        if (request.BalancedRetrieval && request.PolicyIds?.Count > 1)
+        {
+            return await SearchBalancedAsync(request, ct);
+        }
+
+        // Standard single-policy search (unchanged behavior)
+        return await SearchStandardAsync(request, ct);
+    }
+
+    /// <summary>
+    /// Standard search - returns top N chunks across all documents (existing behavior).
+    /// </summary>
+    private async Task<List<ChunkSearchResult>> SearchStandardAsync(
+        SemanticSearchRequest request,
+        CancellationToken ct)
+    {
         _logger.LogInformation(
             "Semantic search: TopK={TopK}, MinSimilarity={MinSimilarity}, TenantId={TenantId}, " +
             "PolicyIds={PolicyIdCount}, DocumentIds={DocumentIdCount}",
@@ -110,5 +127,106 @@ public class SemanticSearchService : ISemanticSearchService
             searchResults.FirstOrDefault()?.Similarity ?? 0);
 
         return searchResults;
+    }
+
+    /// <summary>
+    /// Balanced search - retrieves equal chunks from each policy for fair comparison.
+    /// Each policy gets ChunksPerPolicy chunks (default 12).
+    /// </summary>
+    private async Task<List<ChunkSearchResult>> SearchBalancedAsync(
+        SemanticSearchRequest request,
+        CancellationToken ct)
+    {
+        var policyIds = request.PolicyIds!;
+        var chunksPerPolicy = request.ChunksPerPolicy;
+
+        _logger.LogInformation(
+            "Balanced semantic search: {PolicyCount} policies, {ChunksPerPolicy} chunks each, " +
+            "MinSimilarity={MinSimilarity}, TenantId={TenantId}",
+            policyIds.Count,
+            chunksPerPolicy,
+            request.MinSimilarity,
+            request.TenantId);
+
+        // Get policy info (document IDs, carrier names, policy numbers)
+        var policyInfo = await _dbContext.Policies
+            .Where(p => policyIds.Contains(p.Id) && p.SourceDocumentId != null)
+            .Select(p => new
+            {
+                p.Id,
+                DocumentId = p.SourceDocumentId!.Value,
+                p.CarrierName,
+                p.PolicyNumber
+            })
+            .ToListAsync(ct);
+
+        if (policyInfo.Count == 0)
+        {
+            _logger.LogWarning("No policies found with source documents for balanced search");
+            return [];
+        }
+
+        var queryVector = new Vector(request.QueryEmbedding);
+        var allResults = new List<ChunkSearchResult>();
+
+        // Query each policy separately to ensure balanced representation
+        foreach (var policy in policyInfo)
+        {
+            var policyResults = await _dbContext.DocumentChunks
+                .Include(c => c.Document)
+                .Where(c => c.Document.TenantId == request.TenantId)
+                .Where(c => c.DocumentId == policy.DocumentId)
+                .Where(c => c.Embedding != null)
+                .OrderBy(c => c.Embedding!.CosineDistance(queryVector))
+                .Take(chunksPerPolicy * 2) // Fetch extra for filtering
+                .Select(c => new
+                {
+                    c.Id,
+                    c.DocumentId,
+                    c.Document.FileName,
+                    c.ChunkText,
+                    c.ChunkIndex,
+                    c.PageStart,
+                    c.PageEnd,
+                    c.SectionType,
+                    Distance = c.Embedding!.CosineDistance(queryVector)
+                })
+                .ToListAsync(ct);
+
+            var policyChunks = policyResults
+                .Select(r => new ChunkSearchResult
+                {
+                    ChunkId = r.Id,
+                    DocumentId = r.DocumentId,
+                    DocumentName = r.FileName,
+                    ChunkText = r.ChunkText,
+                    ChunkIndex = r.ChunkIndex,
+                    PageStart = r.PageStart,
+                    PageEnd = r.PageEnd,
+                    SectionType = r.SectionType,
+                    Similarity = 1 - r.Distance,
+                    PolicyId = policy.Id,
+                    CarrierName = policy.CarrierName,
+                    PolicyNumber = policy.PolicyNumber
+                })
+                .Where(r => r.Similarity >= request.MinSimilarity)
+                .Take(chunksPerPolicy)
+                .ToList();
+
+            allResults.AddRange(policyChunks);
+
+            _logger.LogDebug(
+                "Policy {PolicyId} ({Carrier}): {ChunkCount} chunks retrieved",
+                policy.Id,
+                policy.CarrierName ?? "Unknown",
+                policyChunks.Count);
+        }
+
+        _logger.LogInformation(
+            "Balanced search returned {TotalChunks} chunks from {PolicyCount} policies",
+            allResults.Count,
+            policyInfo.Count);
+
+        return allResults;
     }
 }

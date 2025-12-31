@@ -2,6 +2,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Threading.RateLimiting;
 using Hangfire;
+using Hangfire.Dashboard;
 using Hangfire.PostgreSql;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
@@ -56,6 +57,20 @@ builder.Services.AddCors(options =>
 // UseVector() must be called on BOTH the data source builder AND the EF Core options
 var connectionString = builder.Configuration.GetValue<string>("Database:ConnectionString")
     ?? throw new InvalidOperationException("Database connection string is required");
+
+// =============================================================================
+// CONNECTION POOL CONFIGURATION - Phase 2.2 Production Hardening
+// Purpose: Support ~300 concurrent users without connection exhaustion
+// Settings:
+//   - Maximum Pool Size=100: Supports 100 concurrent DB operations
+//   - Minimum Pool Size=10: Keeps connections warm for fast response
+//   - Connection Idle Lifetime=300: Closes idle connections after 5 minutes
+// =============================================================================
+if (!connectionString.Contains("Maximum Pool Size", StringComparison.OrdinalIgnoreCase))
+{
+    connectionString += ";Maximum Pool Size=100;Minimum Pool Size=10;Connection Idle Lifetime=300";
+}
+
 var dataSourceBuilder = new NpgsqlDataSourceBuilder(connectionString);
 dataSourceBuilder.UseVector();
 var dataSource = dataSourceBuilder.Build();
@@ -128,15 +143,39 @@ builder.Services.AddHangfire(config => config
     .UseRecommendedSerializerSettings()
     .UsePostgreSqlStorage(options => options.UseNpgsqlConnection(connectionString)));
 
-// Add Hangfire server with 2 worker threads for parallel processing
+// =============================================================================
+// HANGFIRE SERVER CONFIGURATION - Phase 3.1 Performance Tuning
+// Purpose: Background job processing for document extraction
+// Workers: 6 allows processing 6 documents simultaneously
+//   - Each worker handles one document extraction
+//   - 6 workers = 6 concurrent Claude API calls
+//   - ~360 documents/hour throughput (at 10-30 sec per document)
+// Note: Claude API has rate limits, don't increase beyond 6 without testing
+// =============================================================================
 builder.Services.AddHangfireServer(options =>
 {
-    options.WorkerCount = 2;
+    options.WorkerCount = 6;
     options.Queues = new[] { "default", "extraction" };
 });
 
 // Configure SignalR for real-time notifications
 builder.Services.AddSignalR();
+
+// =============================================================================
+// HEALTH CHECKS
+// Purpose: Tells Render/Docker if the API is healthy
+// Used by: Dockerfile HEALTHCHECK, render.yaml, load balancers
+// Endpoints: /health (simple), /health/ready (detailed with dependency checks)
+// =============================================================================
+builder.Services.AddHealthChecks()
+    .AddNpgSql(
+        connectionString,
+        name: "database",
+        tags: new[] { "db", "critical" })
+    .AddHangfire(options =>
+    {
+        options.MinimumAvailableServers = 1;
+    }, name: "hangfire", tags: new[] { "background-jobs" });
 
 // Register SignalR notification service
 builder.Services.AddScoped<INotificationService, SignalRNotificationService>();
@@ -290,13 +329,54 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
 
+// =============================================================================
+// HANGFIRE DASHBOARD - Phase 3.2 Performance Monitoring
+// Purpose: Admin UI for monitoring and managing background jobs
+// Security: Only accessible to super admins (checked via JWT claims)
+// URL: /hangfire
+// Features: View job queues, processing stats, failed jobs, retry jobs
+// =============================================================================
+app.UseHangfireDashboard("/hangfire", new Hangfire.DashboardOptions
+{
+    Authorization = new[] { new HangfireAuthorizationFilter() },
+    DashboardTitle = "Mnemo - Background Jobs",
+    DisplayStorageConnectionString = false // Hide connection string for security
+});
+
 // Map SignalR hub for real-time notifications
 app.MapHub<NotificationHub>("/hubs/notifications");
 
-// Health check endpoint
+// =============================================================================
+// HEALTH CHECK ENDPOINTS
+// /health - Simple check, returns 200 if API is running (used by Docker)
+// /health/ready - Detailed check with database and Hangfire status
+// =============================================================================
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }))
     .WithName("HealthCheck")
-    .WithTags("Health");
+    .WithTags("Health")
+    .AllowAnonymous();
+
+app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("critical"),
+    ResponseWriter = async (context, report) =>
+    {
+        context.Response.ContentType = "application/json";
+        var result = new
+        {
+            status = report.Status.ToString(),
+            timestamp = DateTime.UtcNow,
+            checks = report.Entries.Select(e => new
+            {
+                name = e.Key,
+                status = e.Value.Status.ToString(),
+                duration = e.Value.Duration.TotalMilliseconds,
+                description = e.Value.Description
+            })
+        };
+        await context.Response.WriteAsJsonAsync(result);
+    }
+}).AllowAnonymous();
 
 // ==================== Auth Endpoints ====================
 
@@ -321,11 +401,12 @@ app.MapPost("/auth/signup", async (
         return Results.BadRequest("Valid email is required");
     }
 
-    if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length < 6)
+    // Phase 2.3: Stronger password requirements for production
+    if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length < 12)
     {
         await auditService.LogEventAsync("signup", "failure", ipAddress: ipAddress, userAgent: userAgent,
             details: new { email = request.Email, reason = "weak_password" });
-        return Results.BadRequest("Password must be at least 6 characters");
+        return Results.BadRequest("Password must be at least 12 characters");
     }
 
     if (string.IsNullOrWhiteSpace(request.CompanyName))
@@ -786,6 +867,56 @@ app.MapPatch("/tenant/users/{userId:guid}/reactivate", async (
 
 // ==================== Document Endpoints ====================
 
+// =============================================================================
+// FILE UPLOAD VALIDATION
+// Purpose: Prevent oversized/malicious uploads
+// Security: Blocks files > 100MB, validates PDF magic bytes
+// Used by: /documents/upload, /documents/upload/batch
+// =============================================================================
+const long MaxFileSizeBytes = 100 * 1024 * 1024; // 100 MB
+byte[] pdfMagicBytes = { 0x25, 0x50, 0x44, 0x46 }; // %PDF
+
+// Helper function to validate PDF file
+async Task<(bool IsValid, string? Error)> ValidatePdfFileAsync(IFormFile file, ILogger logger)
+{
+    // Check file size BEFORE reading into memory (prevents memory exhaustion)
+    if (file.Length > MaxFileSizeBytes)
+    {
+        logger.LogWarning(
+            "File upload rejected: {FileName} is {SizeMB}MB, max is {MaxMB}MB",
+            file.FileName,
+            file.Length / (1024 * 1024),
+            MaxFileSizeBytes / (1024 * 1024));
+        return (false, $"File too large. Maximum size is {MaxFileSizeBytes / (1024 * 1024)}MB");
+    }
+
+    // Check Content-Type header
+    if (!file.ContentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase))
+    {
+        // Also allow if filename ends with .pdf (some browsers don't set Content-Type correctly)
+        if (!file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, "Only PDF files are accepted");
+        }
+    }
+
+    // Check PDF magic bytes (file signature) - prevents uploading .exe renamed to .pdf
+    await using var stream = file.OpenReadStream();
+    var header = new byte[4];
+    var bytesRead = await stream.ReadAsync(header, 0, 4);
+
+    if (bytesRead < 4 || !header.SequenceEqual(pdfMagicBytes))
+    {
+        logger.LogWarning(
+            "File upload rejected: {FileName} is not a valid PDF (magic bytes: {Bytes})",
+            file.FileName,
+            BitConverter.ToString(header));
+        return (false, "File is not a valid PDF document");
+    }
+
+    return (true, null);
+}
+
 // POST /documents/upload - Upload a single document
 app.MapPost("/documents/upload", async (
     IFormFile file,
@@ -799,16 +930,14 @@ app.MapPost("/documents/upload", async (
     if (!currentUser.TenantId.HasValue || !currentUser.UserId.HasValue)
         return Results.Unauthorized();
 
-    // Validate file
+    // Validate file exists
     if (file == null || file.Length == 0)
         return Results.BadRequest("No file provided");
 
-    // Only accept PDFs for now
-    if (!file.ContentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) &&
-        !file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
-    {
-        return Results.BadRequest("Only PDF files are accepted");
-    }
+    // Validate file (size, type, magic bytes) - Phase 2.1 security hardening
+    var (isValid, validationError) = await ValidatePdfFileAsync(file, logger);
+    if (!isValid)
+        return Results.BadRequest(validationError);
 
     var documentId = Guid.NewGuid();
     var tenantId = currentUser.TenantId.Value;
@@ -897,17 +1026,24 @@ app.MapPost("/documents/upload/batch", async (
     if (files.Count > maxBatchSize)
         return Results.BadRequest($"Maximum {maxBatchSize} files per batch");
 
+    // Check total batch size (prevent uploading 5 x 100MB = 500MB at once)
+    var totalBatchSize = files.Sum(f => f.Length);
+    if (totalBatchSize > MaxFileSizeBytes * maxBatchSize)
+    {
+        return Results.BadRequest($"Total batch size exceeds maximum ({MaxFileSizeBytes * maxBatchSize / (1024 * 1024)}MB)");
+    }
+
     var tenantId = currentUser.TenantId.Value;
     var uploadedDocs = new List<DocumentUploadResponse>();
     var errors = new List<string>();
 
     foreach (var file in files)
     {
-        // Skip non-PDF files
-        if (!file.ContentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) &&
-            !file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        // Validate file (size, type, magic bytes) - Phase 2.1 security hardening
+        var (isValid, validationError) = await ValidatePdfFileAsync(file, logger);
+        if (!isValid)
         {
-            errors.Add($"Skipped '{file.FileName}': Only PDF files are accepted");
+            errors.Add($"Skipped '{file.FileName}': {validationError}");
             continue;
         }
 
@@ -1143,6 +1279,61 @@ app.MapDelete("/documents/{id:guid}", async (
 
 // ==================== Webhook Endpoints ====================
 
+// =============================================================================
+// SSRF PROTECTION - Phase 2.3 Security Hardening
+// Purpose: Prevent webhooks from targeting internal/private networks
+// Used by: /webhooks POST endpoint
+// =============================================================================
+bool IsPrivateOrReservedUrl(string url)
+{
+    if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        return true; // Invalid URL = block it
+
+    var host = uri.Host.ToLowerInvariant();
+
+    // Block localhost variations
+    if (host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]")
+        return true;
+
+    // Block .local domains
+    if (host.EndsWith(".local") || host.EndsWith(".localhost"))
+        return true;
+
+    // Block internal network hostnames
+    if (host.EndsWith(".internal") || host.EndsWith(".corp") || host.EndsWith(".lan"))
+        return true;
+
+    // Block IP addresses in private ranges
+    if (System.Net.IPAddress.TryParse(host, out var ip))
+    {
+        var bytes = ip.GetAddressBytes();
+
+        // Only check IPv4 addresses
+        if (bytes.Length == 4)
+        {
+            // 10.0.0.0/8 - Private network
+            if (bytes[0] == 10) return true;
+
+            // 172.16.0.0/12 - Private network
+            if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) return true;
+
+            // 192.168.0.0/16 - Private network
+            if (bytes[0] == 192 && bytes[1] == 168) return true;
+
+            // 169.254.0.0/16 - Link-local
+            if (bytes[0] == 169 && bytes[1] == 254) return true;
+
+            // 127.0.0.0/8 - Loopback
+            if (bytes[0] == 127) return true;
+
+            // 0.0.0.0/8 - Current network
+            if (bytes[0] == 0) return true;
+        }
+    }
+
+    return false;
+}
+
 // POST /webhooks - Create a new webhook
 app.MapPost("/webhooks", async (
     CreateWebhookRequest request,
@@ -1159,6 +1350,15 @@ app.MapPost("/webhooks", async (
 
     if (uri.Scheme != "https" && uri.Scheme != "http")
         return Results.BadRequest("URL must use HTTP or HTTPS");
+
+    // Phase 2.3: SSRF Protection - block private/internal network URLs
+    if (IsPrivateOrReservedUrl(request.Url))
+    {
+        logger.LogWarning(
+            "Webhook creation rejected for tenant {TenantId}: URL points to private/internal network: {Url}",
+            currentUser.TenantId, request.Url);
+        return Results.BadRequest("Webhook URL cannot point to private or internal network addresses");
+    }
 
     // Validate events
     if (request.Events == null || request.Events.Count == 0)
@@ -2205,6 +2405,36 @@ public partial class Program
         {
             return null;
         }
+    }
+}
+
+// =============================================================================
+// HANGFIRE AUTHORIZATION FILTER - Phase 3.2
+// Purpose: Restricts Hangfire dashboard access to super admins only
+// Security: Checks JWT claims for user email, validates against SUPERADMIN_EMAILS
+// Used by: UseHangfireDashboard middleware configuration
+// =============================================================================
+public class HangfireAuthorizationFilter : Hangfire.Dashboard.IDashboardAuthorizationFilter
+{
+    public bool Authorize(Hangfire.Dashboard.DashboardContext context)
+    {
+        var httpContext = context.GetHttpContext();
+
+        // Check if user is authenticated
+        if (httpContext?.User?.Identity?.IsAuthenticated != true)
+            return false;
+
+        // Get email from JWT claims
+        var email = httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value
+            ?? httpContext.User.FindFirst("email")?.Value;
+
+        if (string.IsNullOrEmpty(email))
+            return false;
+
+        // Check if user is a super admin
+        var superAdminEmails = Environment.GetEnvironmentVariable("SUPERADMIN_EMAILS") ?? "";
+        var adminList = superAdminEmails.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return adminList.Contains(email, StringComparer.OrdinalIgnoreCase);
     }
 }
 

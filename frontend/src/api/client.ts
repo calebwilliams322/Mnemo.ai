@@ -1,7 +1,21 @@
 import axios, { type AxiosError, type AxiosInstance } from 'axios';
 import { supabase } from '../lib/supabase';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+// =============================================================================
+// API CLIENT CONFIGURATION - Phase 4.1 Production Safety
+// Purpose: Prevent silent failures from missing env vars in production
+// In development (DEV mode), falls back to localhost for convenience.
+// In production builds, fails fast if VITE_API_URL is not set.
+// =============================================================================
+const API_URL = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://localhost:5115' : null);
+
+// Fail fast if environment variable is missing in production
+if (!API_URL) {
+  throw new Error(
+    'VITE_API_URL environment variable is required. ' +
+    'Set it to your API URL (e.g., https://mnemo-api.onrender.com)'
+  );
+}
 
 export const apiClient: AxiosInstance = axios.create({
   baseURL: API_URL,

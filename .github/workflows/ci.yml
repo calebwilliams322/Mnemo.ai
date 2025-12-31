@@ -1,0 +1,138 @@
+# =============================================================================
+# CI/CD Pipeline for Mnemo Insurance
+# =============================================================================
+# Triggers: Push to main, Pull requests
+# Actions: Build, Test, Docker image, Deploy notification
+#
+# Prerequisites:
+# - Dockerfile exists at repo root
+# - Health check endpoint at /health
+#
+# Used by:
+# - Every code push to main
+# - Pull request validation
+# - Render deployment (auto-deploys from Docker image)
+# =============================================================================
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ===========================================================================
+  # BUILD & TEST
+  # ===========================================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore src/Mnemo.Api/Mnemo.Api.csproj
+
+      - name: Build
+        run: dotnet build src/Mnemo.Api/Mnemo.Api.csproj --no-restore -c Release
+
+      # NOTE: Uncomment when tests exist
+      # - name: Run tests
+      #   run: dotnet test tests/ --no-build -c Release --verbosity normal
+
+  # ===========================================================================
+  # DOCKER BUILD & PUSH
+  # ===========================================================================
+  docker:
+    name: Docker Build & Push
+    needs: build
+    runs-on: ubuntu-latest
+    # Only build Docker on main branch (not PRs)
+    if: github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Image build summary
+        run: |
+          echo "## Docker Image Built Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**SHA Tag:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # DEPLOYMENT NOTIFICATION
+  # ===========================================================================
+  deploy-notify:
+    name: Deployment Ready
+    needs: docker
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Ready" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Docker image has been pushed to GitHub Container Registry." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "1. Render will auto-deploy if configured with this image" >> $GITHUB_STEP_SUMMARY
+          echo "2. Or manually trigger deployment in Render dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Health check:** Once deployed, verify at \`/health\` endpoint" >> $GITHUB_STEP_SUMMARY
+
+      # Optional: Trigger Render deploy hook
+      # Uncomment and add RENDER_DEPLOY_HOOK secret to enable
+      # - name: Trigger Render Deploy
+      #   if: env.RENDER_DEPLOY_HOOK != ''
+      #   env:
+      #     RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+      #   run: |
+      #     curl -X POST "$RENDER_DEPLOY_HOOK"

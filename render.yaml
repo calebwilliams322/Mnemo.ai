@@ -1,0 +1,118 @@
+# =============================================================================
+# Render Blueprint - Mnemo Insurance
+# =============================================================================
+# This file defines all infrastructure on Render
+# To use: Connect repo to Render, it will auto-detect this file
+#
+# Prerequisites:
+# - Dockerfile exists at repo root (Phase 1.1)
+# - Health check endpoint at /health (Phase 1.2)
+# - CI/CD pushes Docker image to ghcr.io (Phase 1.3)
+#
+# Used by:
+# - Render's Blueprint feature (auto-creates services from this file)
+# - Future infrastructure changes
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # API SERVICE
+  # ===========================================================================
+  - type: web
+    name: mnemo-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+
+    # Single instance is sufficient for ~300 users
+    # Can upgrade to "standard" for more CPU/RAM later
+    plan: starter
+
+    # Region - choose closest to your users
+    region: oregon
+
+    # Health check configuration
+    # References: Phase 1.2 health endpoints
+    healthCheckPath: /health
+
+    # Environment variables
+    # NOTE: Set actual values in Render dashboard, not here (secrets!)
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+
+      # Database - from Supabase
+      # Set in Render dashboard (secret)
+      - key: DATABASE_CONNECTION_STRING
+        sync: false
+
+      # Supabase Auth
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+
+      # AI APIs
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # Storage
+      - key: SUPABASE_STORAGE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+
+  # ===========================================================================
+  # FRONTEND (Static Site)
+  # ===========================================================================
+  - type: web
+    name: mnemo-frontend
+    runtime: static
+
+    # Build configuration
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
+
+    # SPA routing - all paths serve index.html
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    # Headers for security and caching
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+
+    # Environment variables for build
+    envVars:
+      - key: VITE_API_URL
+        # Will be set to mnemo-api URL after deployment
+        # Example: https://mnemo-api.onrender.com
+        sync: false
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+
+# =============================================================================
+# FUTURE: Add Redis when scaling to multiple instances
+# =============================================================================
+# Uncomment when you need:
+# - Zero-downtime deployments
+# - Multiple API instances
+# - 1000+ concurrent users
+#
+# databases:
+#   - name: mnemo-redis
+#     plan: starter
+#     databaseName: mnemo-cache
+#     engine: redis

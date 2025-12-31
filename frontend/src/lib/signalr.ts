@@ -7,7 +7,8 @@ import type {
   ProcessingCompleteEvent,
 } from '../api/types';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+// Use the same API_URL as the main client (no fallback to prevent silent failures)
+import { API_URL } from '../api/client';
 let connection: signalR.HubConnection | null = null;
 
 export async function connectSignalR(): Promise<signalR.HubConnection> {

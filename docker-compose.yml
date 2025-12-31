@@ -1,0 +1,51 @@
+# =============================================================================
+# Mnemo Insurance - Docker Compose
+# =============================================================================
+# Usage:
+#   docker-compose up --build     # Build and start all services
+#   docker-compose up -d          # Start in background
+#   docker-compose down           # Stop all services
+#   docker-compose logs -f api    # Follow API logs
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # API Service
+  # ===========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5115:8080"
+    env_file:
+      - .env
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - PORT=8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # ===========================================================================
+  # Frontend Service (Vite dev server)
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:5115
+      - VITE_SUPABASE_URL=${VITE_SUPABASE_URL:-https://jcfyszulftfutsvtrghz.supabase.co}
+      - VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY:-sb_publishable_3FXsh-HAZ3_ivbrXdLo9Kg_cZq-YvjI}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      api:
+        condition: service_healthy

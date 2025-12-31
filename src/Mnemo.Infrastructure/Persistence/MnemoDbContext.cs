@@ -35,6 +35,8 @@ public class MnemoDbContext : DbContext
     public DbSet<Webhook> Webhooks => Set<Webhook>();
     public DbSet<WebhookDelivery> WebhookDeliveries => Set<WebhookDelivery>();
     public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
+    public DbSet<ProposalTemplate> ProposalTemplates => Set<ProposalTemplate>();
+    public DbSet<Proposal> Proposals => Set<Proposal>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -81,6 +83,8 @@ public class MnemoDbContext : DbContext
         ConfigureWebhook(modelBuilder);
         ConfigureWebhookDelivery(modelBuilder);
         ConfigureAuditEvent(modelBuilder);
+        ConfigureProposalTemplate(modelBuilder);
+        ConfigureProposal(modelBuilder);
 
         // Global query filters for tenant isolation
         // All tenant-scoped entities automatically filter by current tenant
@@ -92,6 +96,8 @@ public class MnemoDbContext : DbContext
         modelBuilder.Entity<ComplianceCheck>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
         modelBuilder.Entity<Conversation>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
         modelBuilder.Entity<Webhook>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<ProposalTemplate>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
+        modelBuilder.Entity<Proposal>().HasQueryFilter(e => CurrentTenantId == null || e.TenantId == CurrentTenantId);
         // Note: Tenant, IndustryBenchmark are not tenant-scoped (shared or root)
         // Note: DocumentChunk, Coverage, Message, WebhookDelivery are accessed via parent entities
     }
@@ -446,6 +452,59 @@ public class MnemoDbContext : DbContext
             entity.HasOne(e => e.User)
                 .WithMany()
                 .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+    }
+
+    private static void ConfigureProposalTemplate(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<ProposalTemplate>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Name).HasMaxLength(255).IsRequired();
+            entity.Property(e => e.Description).HasMaxLength(1000);
+            entity.Property(e => e.StoragePath).HasMaxLength(500).IsRequired();
+            entity.Property(e => e.OriginalFileName).HasMaxLength(255).IsRequired();
+            entity.Property(e => e.Placeholders).HasColumnType("jsonb").IsRequired();
+
+            entity.HasIndex(e => e.TenantId);
+            entity.HasIndex(e => new { e.TenantId, e.IsActive });
+
+            entity.HasOne(e => e.Tenant)
+                .WithMany()
+                .HasForeignKey(e => e.TenantId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+
+    private static void ConfigureProposal(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Proposal>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.ClientName).HasMaxLength(255).IsRequired();
+            entity.Property(e => e.PolicyIds).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.OutputStoragePath).HasMaxLength(500);
+            entity.Property(e => e.Status).HasMaxLength(50).IsRequired();
+            entity.Property(e => e.ErrorMessage).HasMaxLength(1000);
+
+            entity.HasIndex(e => e.TenantId);
+            entity.HasIndex(e => e.TemplateId);
+            entity.HasIndex(e => e.CreatedByUserId);
+
+            entity.HasOne(e => e.Tenant)
+                .WithMany()
+                .HasForeignKey(e => e.TenantId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(e => e.Template)
+                .WithMany(t => t.Proposals)
+                .HasForeignKey(e => e.TemplateId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(e => e.CreatedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.CreatedByUserId)
                 .OnDelete(DeleteBehavior.SetNull);
         });
     }

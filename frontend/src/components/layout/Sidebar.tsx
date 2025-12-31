@@ -5,6 +5,7 @@ import {
   ShieldCheckIcon,
   ChatBubbleLeftRightIcon,
   ScaleIcon,
+  DocumentArrowDownIcon,
 } from '@heroicons/react/24/outline';
 import { clsx } from 'clsx';
 
@@ -13,6 +14,7 @@ const navigation = [
   { name: 'Documents', href: '/documents', icon: DocumentTextIcon },
   { name: 'Policies', href: '/policies', icon: ShieldCheckIcon },
   { name: 'Compare Quotes', href: '/quote-comparison', icon: ScaleIcon },
+  { name: 'Proposals', href: '/proposals', icon: DocumentArrowDownIcon },
   { name: 'Chat', href: '/chat', icon: ChatBubbleLeftRightIcon },
 ];
 

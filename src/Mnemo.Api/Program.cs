@@ -192,6 +192,10 @@ builder.Services.AddScoped<IWebhookService, WebhookService>();
 // Register Usage Service (admin analytics)
 builder.Services.AddScoped<IUsageService, UsageService>();
 
+// Register Proposal Services (Phase: Proposal Generation)
+builder.Services.AddScoped<IDocumentGeneratorService, DocumentGeneratorService>();
+builder.Services.AddScoped<IProposalService, ProposalService>();
+
 // Register webhook event handlers (subscribe to same events as SignalR)
 builder.Services.AddScoped<IEventHandler<DocumentUploadedEvent>, WebhookDocumentUploadedHandler>();
 builder.Services.AddScoped<IEventHandler<DocumentProcessingStartedEvent>, WebhookDocumentProcessingStartedHandler>();
@@ -2349,6 +2353,270 @@ app.MapGet("/admin/me", async (
 .WithTags("Admin")
 .RequireRateLimiting("api");
 
+// =============================================================================
+// PROPOSAL TEMPLATES - Upload and manage Word templates for proposal generation
+// =============================================================================
+
+// POST /templates/upload - Upload a new proposal template
+app.MapPost("/templates/upload", async (
+    IFormFile file,
+    [FromForm] string name,
+    [FromForm] string? description,
+    IProposalService proposalService,
+    ICurrentUserService currentUser,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    // Validate file exists
+    if (file == null || file.Length == 0)
+        return Results.BadRequest(new { error = "No file provided" });
+
+    // Validate file type (.docx)
+    var validContentTypes = new[]
+    {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/octet-stream" // Some browsers send this for .docx
+    };
+
+    if (!validContentTypes.Contains(file.ContentType, StringComparer.OrdinalIgnoreCase) &&
+        !file.FileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest(new { error = "Only .docx files are accepted" });
+    }
+
+    // Validate name
+    if (string.IsNullOrWhiteSpace(name))
+        return Results.BadRequest(new { error = "Template name is required" });
+
+    try
+    {
+        await using var stream = file.OpenReadStream();
+        var template = await proposalService.UploadTemplateAsync(
+            stream,
+            file.FileName,
+            name,
+            description,
+            currentUser.TenantId.Value);
+
+        logger.LogInformation(
+            "Template uploaded: {TemplateId} ({Name}) by tenant {TenantId}",
+            template.Id, name, currentUser.TenantId);
+
+        return Results.Created($"/templates/{template.Id}", template);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to upload template");
+        return Results.Problem("Failed to upload template");
+    }
+})
+.RequireAuthorization()
+.DisableAntiforgery()
+.WithName("UploadTemplate")
+.WithTags("Proposals")
+.RequireRateLimiting("api");
+
+// GET /templates - List all templates for the tenant
+app.MapGet("/templates", async (
+    IProposalService proposalService,
+    ICurrentUserService currentUser) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var templates = await proposalService.GetTemplatesAsync(currentUser.TenantId.Value);
+    return Results.Ok(templates);
+})
+.RequireAuthorization()
+.WithName("GetTemplates")
+.WithTags("Proposals")
+.RequireRateLimiting("api");
+
+// GET /templates/{id} - Get a specific template
+app.MapGet("/templates/{id:guid}", async (
+    Guid id,
+    IProposalService proposalService,
+    ICurrentUserService currentUser) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var template = await proposalService.GetTemplateAsync(id, currentUser.TenantId.Value);
+    if (template == null)
+        return Results.NotFound();
+
+    return Results.Ok(template);
+})
+.RequireAuthorization()
+.WithName("GetTemplate")
+.WithTags("Proposals")
+.RequireRateLimiting("api");
+
+// DELETE /templates/{id} - Delete (soft) a template
+app.MapDelete("/templates/{id:guid}", async (
+    Guid id,
+    IProposalService proposalService,
+    ICurrentUserService currentUser,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var deleted = await proposalService.DeleteTemplateAsync(id, currentUser.TenantId.Value);
+    if (!deleted)
+        return Results.NotFound();
+
+    logger.LogInformation("Template deleted: {TemplateId} by tenant {TenantId}", id, currentUser.TenantId);
+    return Results.NoContent();
+})
+.RequireAuthorization()
+.WithName("DeleteTemplate")
+.WithTags("Proposals")
+.RequireRateLimiting("api");
+
+// =============================================================================
+// PROPOSALS - Generate and download proposal documents
+// =============================================================================
+
+// POST /proposals/generate - Generate a proposal from template and policies
+app.MapPost("/proposals/generate", async (
+    GenerateProposalRequest request,
+    IProposalService proposalService,
+    ICurrentUserService currentUser,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    if (request.TemplateId == Guid.Empty)
+        return Results.BadRequest(new { error = "Template ID is required" });
+
+    if (request.PolicyIds == null || request.PolicyIds.Count == 0)
+        return Results.BadRequest(new { error = "At least one policy must be selected" });
+
+    try
+    {
+        var proposal = await proposalService.GenerateProposalAsync(
+            request.TemplateId,
+            request.PolicyIds,
+            currentUser.TenantId.Value,
+            currentUser.UserId);
+
+        logger.LogInformation(
+            "Proposal generated: {ProposalId} from template {TemplateId} with {PolicyCount} policies",
+            proposal.Id, request.TemplateId, request.PolicyIds.Count);
+
+        // Project to avoid circular reference with Template.Proposals
+        return Results.Ok(new
+        {
+            proposal.Id,
+            proposal.TenantId,
+            proposal.TemplateId,
+            proposal.ClientName,
+            proposal.PolicyIds,
+            proposal.OutputStoragePath,
+            proposal.Status,
+            proposal.ErrorMessage,
+            proposal.CreatedAt,
+            proposal.GeneratedAt,
+            proposal.CreatedByUserId
+        });
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to generate proposal");
+        return Results.Problem("Failed to generate proposal");
+    }
+})
+.RequireAuthorization()
+.WithName("GenerateProposal")
+.WithTags("Proposals")
+.RequireRateLimiting("api");
+
+// GET /proposals - List all proposals for the tenant
+app.MapGet("/proposals", async (
+    IProposalService proposalService,
+    ICurrentUserService currentUser) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    var proposals = await proposalService.GetProposalsAsync(currentUser.TenantId.Value);
+
+    // Project to avoid circular reference with Template.Proposals
+    var result = proposals.Select(p => new
+    {
+        p.Id,
+        p.TenantId,
+        p.TemplateId,
+        p.ClientName,
+        p.PolicyIds,
+        p.OutputStoragePath,
+        p.Status,
+        p.ErrorMessage,
+        p.CreatedAt,
+        p.GeneratedAt,
+        p.CreatedByUserId,
+        Template = p.Template != null ? new
+        {
+            p.Template.Id,
+            p.Template.Name,
+            p.Template.Description,
+            p.Template.IsDefault
+        } : null
+    });
+
+    return Results.Ok(result);
+})
+.RequireAuthorization()
+.WithName("GetProposals")
+.WithTags("Proposals")
+.RequireRateLimiting("api");
+
+// GET /proposals/{id}/download - Download a generated proposal
+app.MapGet("/proposals/{id:guid}/download", async (
+    Guid id,
+    IProposalService proposalService,
+    ICurrentUserService currentUser,
+    ILogger<Program> logger) =>
+{
+    if (!currentUser.TenantId.HasValue)
+        return Results.Unauthorized();
+
+    try
+    {
+        var stream = await proposalService.DownloadProposalAsync(id, currentUser.TenantId.Value);
+
+        return Results.File(
+            stream,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            $"proposal-{id}.docx");
+    }
+    catch (ArgumentException)
+    {
+        return Results.NotFound();
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to download proposal {ProposalId}", id);
+        return Results.Problem("Failed to download proposal");
+    }
+})
+.RequireAuthorization()
+.WithName("DownloadProposal")
+.WithTags("Proposals")
+.RequireRateLimiting("api");
+
 app.Run();
 
 // Make Program accessible for integration tests
@@ -2436,6 +2704,18 @@ public class HangfireAuthorizationFilter : Hangfire.Dashboard.IDashboardAuthoriz
         var adminList = superAdminEmails.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         return adminList.Contains(email, StringComparer.OrdinalIgnoreCase);
     }
+}
+
+/// <summary>
+/// Request model for proposal generation.
+/// </summary>
+internal record GenerateProposalRequest
+{
+    [System.Text.Json.Serialization.JsonPropertyName("templateId")]
+    public Guid TemplateId { get; init; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("policyIds")]
+    public List<Guid> PolicyIds { get; init; } = new();
 }
 
 /// <summary>

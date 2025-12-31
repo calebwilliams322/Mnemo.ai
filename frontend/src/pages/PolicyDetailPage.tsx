@@ -4,12 +4,14 @@ import {
   ArrowLeftIcon,
   ChatBubbleLeftRightIcon,
   SparklesIcon,
+  DocumentArrowDownIcon,
 } from '@heroicons/react/24/outline';
 import { Card, CardHeader, CardTitle, CardContent, Button, LoadingSpinner, Modal } from '../components/common';
 import { getPolicy, getPolicySummary } from '../api/policies';
 import { createConversation } from '../api/conversations';
 import type { PolicyDetail, PolicySummary } from '../api/types';
 import { notify } from '../stores/notificationStore';
+import { GenerateProposalModal } from '../components/proposals/GenerateProposalModal';
 import { format } from 'date-fns';
 
 export function PolicyDetailPage() {
@@ -20,6 +22,7 @@ export function PolicyDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSummaryLoading, setIsSummaryLoading] = useState(false);
   const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [showProposalModal, setShowProposalModal] = useState(false);
 
   useEffect(() => {
     const loadPolicy = async () => {
@@ -116,6 +119,10 @@ export function PolicyDetailPage() {
           <Button variant="secondary" onClick={handleGenerateSummary} isLoading={isSummaryLoading}>
             <SparklesIcon className="h-4 w-4 mr-2" />
             AI Summary
+          </Button>
+          <Button variant="secondary" onClick={() => setShowProposalModal(true)}>
+            <DocumentArrowDownIcon className="h-4 w-4 mr-2" />
+            Generate Proposal
           </Button>
           <Button onClick={handleStartChat}>
             <ChatBubbleLeftRightIcon className="h-4 w-4 mr-2" />
@@ -308,6 +315,13 @@ export function PolicyDetailPage() {
           </div>
         )}
       </Modal>
+
+      {/* Generate Proposal Modal */}
+      <GenerateProposalModal
+        isOpen={showProposalModal}
+        onClose={() => setShowProposalModal(false)}
+        preSelectedPolicyIds={id ? [id] : []}
+      />
     </div>
   );
 }

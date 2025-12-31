@@ -41,8 +41,8 @@ services:
       - "3000:3000"
     environment:
       - VITE_API_URL=http://localhost:5115
-      - VITE_SUPABASE_URL=${VITE_SUPABASE_URL:-https://jcfyszulftfutsvtrghz.supabase.co}
-      - VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY:-sb_publishable_3FXsh-HAZ3_ivbrXdLo9Kg_cZq-YvjI}
+      - VITE_SUPABASE_URL=${SUPABASE_URL}
+      - VITE_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
     volumes:
       - ./frontend:/app
       - /app/node_modules

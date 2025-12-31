@@ -16,6 +16,8 @@ import { QuoteComparisonPage } from './pages/QuoteComparisonPage';
 import { ChatPage } from './pages/ChatPage';
 import { LandingPage } from './pages/LandingPage';
 import { ProposalTemplatesPage } from './pages/ProposalTemplatesPage';
+import { SettingsPage } from './pages/SettingsPage';
+import { ForgotPasswordPage } from './pages/ForgotPasswordPage';
 import { UsageDashboardPage } from './pages/admin/UsageDashboardPage';
 import { AdminRoute } from './components/admin/AdminRoute';
 
@@ -84,6 +86,14 @@ function App() {
             </PublicRoute>
           }
         />
+        <Route
+          path="/forgot-password"
+          element={
+            <PublicRoute>
+              <ForgotPasswordPage />
+            </PublicRoute>
+          }
+        />
 
         {/* Protected routes with layout */}
         <Route
@@ -102,6 +112,7 @@ function App() {
           <Route path="/proposals" element={<ProposalTemplatesPage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/chat/:id" element={<ChatPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
 
           {/* Admin routes - additional superadmin check */}
           <Route

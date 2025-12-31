@@ -28,7 +28,9 @@ public interface ISupabaseAuthService
     /// Sends a password reset email to the user.
     /// The user will receive an email with a link to reset their password.
     /// </summary>
-    Task<bool> SendPasswordResetAsync(string email);
+    /// <param name="email">The user's email address</param>
+    /// <param name="redirectTo">Optional URL to redirect to after password reset</param>
+    Task<bool> SendPasswordResetAsync(string email, string? redirectTo = null);
 }
 
 public class SupabaseUserResult

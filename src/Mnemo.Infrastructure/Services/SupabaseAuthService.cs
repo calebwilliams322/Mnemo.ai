@@ -148,15 +148,16 @@ public class SupabaseAuthService : ISupabaseAuthService
         }
     }
 
-    public async Task<bool> SendPasswordResetAsync(string email)
+    public async Task<bool> SendPasswordResetAsync(string email, string? redirectTo = null)
     {
         try
         {
             // Use the recovery endpoint to send a password reset email
-            var response = await _httpClient.PostAsJsonAsync("/auth/v1/recover", new
-            {
-                email
-            });
+            object requestBody = redirectTo != null
+                ? new { email, redirect_to = redirectTo }
+                : new { email };
+
+            var response = await _httpClient.PostAsJsonAsync("/auth/v1/recover", requestBody);
 
             if (!response.IsSuccessStatusCode)
             {

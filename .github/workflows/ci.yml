@@ -129,9 +129,14 @@ jobs:
           echo "**Health check:** Once deployed, verify at \`/health\` endpoint" >> $GITHUB_STEP_SUMMARY
 
       # Trigger Render deploy hook (if secret is configured)
+      # To enable: Add RENDER_DEPLOY_HOOK secret in GitHub repo settings
       - name: Trigger Render Deploy
-        if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
         env:
           RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
         run: |
-          curl -X POST "$RENDER_DEPLOY_HOOK"
+          if [ -n "$RENDER_DEPLOY_HOOK" ]; then
+            curl -X POST "$RENDER_DEPLOY_HOOK"
+            echo "Render deploy triggered"
+          else
+            echo "RENDER_DEPLOY_HOOK not set, skipping deploy"
+          fi

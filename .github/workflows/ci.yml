@@ -128,11 +128,10 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Health check:** Once deployed, verify at \`/health\` endpoint" >> $GITHUB_STEP_SUMMARY
 
-      # Optional: Trigger Render deploy hook
-      # Uncomment and add RENDER_DEPLOY_HOOK secret to enable
-      # - name: Trigger Render Deploy
-      #   if: env.RENDER_DEPLOY_HOOK != ''
-      #   env:
-      #     RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
-      #   run: |
-      #     curl -X POST "$RENDER_DEPLOY_HOOK"
+      # Trigger Render deploy hook (if secret is configured)
+      - name: Trigger Render Deploy
+        if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          curl -X POST "$RENDER_DEPLOY_HOOK"

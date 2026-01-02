@@ -63,6 +63,10 @@ services:
       - key: SUPABASE_SERVICE_KEY
         sync: false
 
+      # Frontend URL for CORS
+      - key: FRONTEND_URL
+        sync: false
+
   # ===========================================================================
   # FRONTEND (Static Site)
   # ===========================================================================

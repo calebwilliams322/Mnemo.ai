@@ -41,11 +41,18 @@ builder.Services.AddOpenApi();
 builder.Services.AddHttpContextAccessor();
 
 // Configure CORS for frontend
+var frontendUrl = Environment.GetEnvironmentVariable("FRONTEND_URL");
+var allowedOrigins = new List<string> { "http://localhost:3000", "http://127.0.0.1:3000" };
+if (!string.IsNullOrEmpty(frontendUrl))
+{
+    allowedOrigins.Add(frontendUrl);
+}
+
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.WithOrigins("http://localhost:3000", "http://127.0.0.1:3000")
+        policy.WithOrigins(allowedOrigins.ToArray())
               .AllowAnyHeader()
               .AllowAnyMethod()
               .AllowCredentials();

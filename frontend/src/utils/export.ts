@@ -1,6 +1,8 @@
 /**
- * Export utilities for downloading data as CSV or JSON
+ * Export utilities for downloading data as CSV, JSON, or Excel
  */
+
+import * as XLSX from 'xlsx';
 
 export function downloadFile(content: string, filename: string, mimeType: string) {
   const blob = new Blob([content], { type: mimeType });
@@ -59,4 +61,37 @@ function sanitizeFilename(name: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '')
     || 'data';
+}
+
+export function exportTableAsExcel(title: string, columns: string[], rows: string[][]) {
+  const data = [columns, ...rows];
+  const worksheet = XLSX.utils.aoa_to_sheet(data);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
+
+  // Auto-size columns
+  const colWidths = columns.map((col, i) => {
+    const maxLength = Math.max(
+      col.length,
+      ...rows.map(row => (row[i] || '').length)
+    );
+    return { wch: Math.min(maxLength + 2, 50) };
+  });
+  worksheet['!cols'] = colWidths;
+
+  const filename = `${sanitizeFilename(title)}.xlsx`;
+  XLSX.writeFile(workbook, filename);
+}
+
+export function exportKeyValueAsExcel(title: string, data: Record<string, string>) {
+  const rows = [['Field', 'Value'], ...Object.entries(data)];
+  const worksheet = XLSX.utils.aoa_to_sheet(rows);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
+
+  // Auto-size columns
+  worksheet['!cols'] = [{ wch: 30 }, { wch: 50 }];
+
+  const filename = `${sanitizeFilename(title)}.xlsx`;
+  XLSX.writeFile(workbook, filename);
 }

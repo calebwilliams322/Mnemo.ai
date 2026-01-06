@@ -3,6 +3,8 @@ import {
   exportTableAsCSV,
   exportKeyValueAsCSV,
   exportAsJSON,
+  exportTableAsExcel,
+  exportKeyValueAsExcel,
 } from '../../utils/export';
 
 interface TableData {
@@ -59,11 +61,23 @@ function TableBlock({ data }: { data: TableData }) {
     });
   };
 
+  const handleExportExcel = () => {
+    exportTableAsExcel(data.title || 'table-data', data.columns, data.rows);
+  };
+
   return (
     <div className="data-block">
       <div className="data-block-header">
         <span className="data-block-title">{data.title || 'Data'}</span>
         <div className="data-block-actions">
+          <button
+            onClick={handleExportExcel}
+            className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
+            title="Export as Excel"
+          >
+            <ArrowDownTrayIcon className="h-3.5 w-3.5" />
+            Excel
+          </button>
           <button
             onClick={handleExportCSV}
             className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
@@ -113,11 +127,23 @@ function KeyValueBlock({ data }: { data: KeyValueData }) {
     exportAsJSON(data.title || 'data', data.data);
   };
 
+  const handleExportExcel = () => {
+    exportKeyValueAsExcel(data.title || 'data', data.data);
+  };
+
   return (
     <div className="data-block">
       <div className="data-block-header">
         <span className="data-block-title">{data.title || 'Information'}</span>
         <div className="data-block-actions">
+          <button
+            onClick={handleExportExcel}
+            className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"
+            title="Export as Excel"
+          >
+            <ArrowDownTrayIcon className="h-3.5 w-3.5" />
+            Excel
+          </button>
           <button
             onClick={handleExportCSV}
             className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded transition-colors"

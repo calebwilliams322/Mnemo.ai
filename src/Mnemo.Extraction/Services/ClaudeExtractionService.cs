@@ -135,6 +135,14 @@ public class ClaudeExtractionService : IClaudeExtractionService
             jsonText = jsonText[..^3];
         jsonText = jsonText.Trim();
 
+        // If Claude added explanatory text, extract just the JSON object
+        var firstBrace = jsonText.IndexOf('{');
+        var lastBrace = jsonText.LastIndexOf('}');
+        if (firstBrace >= 0 && lastBrace > firstBrace)
+        {
+            jsonText = jsonText[firstBrace..(lastBrace + 1)];
+        }
+
         using var doc = JsonDocument.Parse(jsonText);
         var root = doc.RootElement;
 
